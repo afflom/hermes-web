@@ -345,9 +345,9 @@ export function openSocketFromUrl(url: string): WebSocket {
 
 // ── REST half of the transport seam ──────────────────────────────────
 // Every REST call in this module goes through `_fetchImpl`. The default is
-// the platform `fetch`; the `hologram` transport swaps it for an HTTP/1.1
-// client over the emulator loopback bridge (see `holo-transport.ts`), so
-// the dashboard reaches the in-guest `web_server.py` with no origin server.
+// the platform `fetch`; the static (no-backend) build swaps it for an inert
+// implementation that answers reads with empty state (see
+// `holo-static-transport.ts`), so a static Pages deploy never 404s `/api`.
 export type FetchImpl = (url: string, init?: RequestInit) => Promise<Response>;
 let _fetchImpl: FetchImpl = (url, init) => fetch(url, init);
 
