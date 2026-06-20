@@ -41,7 +41,14 @@ jobs:
       - name: Install workspace deps (web is an npm workspace; lockfile is at the root)
         run: npm ci
 
-      - name: Build the dashboard (base=/hermes-web/, static no-backend build)
+      - name: Install Chromium (vitest browser mode + Playwright)
+        run: npx playwright install --with-deps chromium
+
+      - name: Unit tests — node + REAL-browser (vitest projects) — FAIL-CLOSED
+        run: npm test
+        working-directory: web
+
+      - name: Build the dashboard (base=/hermes-web/, in-browser holospaces backend)
         run: HERMES_HOLO_BASE=/hermes-web/ npx vite build --outDir dist-pages --emptyOutDir
         working-directory: web
 

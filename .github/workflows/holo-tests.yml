@@ -1,0 +1,63 @@
+name: holospaces tests (web)
+
+# Every part of the in-browser Hermes implementation, evaluated on every push/PR:
+#   • unit (node)    — pure dashboard logic
+#   • unit (browser) — the holospaces parts (transport, egress, BridgeRuntime, content-addressed warm-κ
+#                      codec) run in a REAL Chromium via vitest browser mode
+#   • e2e (Chromium) — the deployed artifact: the substrate runtime loads + re-derives κ; the shell is
+#                      hermes-web (not a Hologram-OS frame, no SW); and — when a warm κ is published —
+#                      the in-browser backend resumes + answers its capability surface.
+on:
+  push:
+    branches: [hermes-web]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install workspace deps (web is an npm workspace; lockfile at the root)
+        run: npm ci
+
+      - name: Install Chromium (vitest browser mode + Playwright e2e)
+        run: npx playwright install --with-deps chromium
+
+      - name: Unit tests — node + REAL-browser (vitest projects)
+        run: npm test
+        working-directory: web
+
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: web
+
+      - name: Build the Pages artifact (base=/hermes-web/)
+        run: HERMES_HOLO_BASE=/hermes-web/ npx vite build --outDir dist-pages --emptyOutDir
+        working-directory: web
+
+      - name: SPA fallback for the static server
+        run: cp web/dist-pages/index.html web/dist-pages/404.html
+
+      - name: Browser e2e (real Chromium against the built artifact)
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          if [ -f ../web/dist-pages/holo/warm/manifest.json ]; then export E2E_EXPECT_HOLOGRAM=1; fi
+          npx playwright test
+        working-directory: e2e
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: e2e/playwright-report
+          retention-days: 7
