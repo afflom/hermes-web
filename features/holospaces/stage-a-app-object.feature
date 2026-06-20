@@ -37,4 +37,4 @@ Feature: Stage A — Hermes as a holospace app object
   Scenario: the sealed root κ is pinned for this build
     # Content-addressed: this reds when web/ changes — the signal to re-pin after a rebuild + reseal.
     When I re-seal the app with relock
-    Then the root κ equals "did:holo:sha256:d7c463e335782959c0ae5f18240c8b1e794091049d5be614fbb493e7d62106b0"
+    Then the root κ equals "did:holo:sha256:9329795a79eda6b5978a596293473b0f4d0a9ea9cdb08766f76cb49c13a629c8"

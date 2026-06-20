@@ -28,8 +28,11 @@ export function usePlugins() {
     api
       .getPlugins()
       .then((list) => {
-        setManifests(list);
-        if (list.length === 0) setLoading(false);
+        // Tolerate a malformed/empty response (e.g. the no-backend static shell): never crash the app
+        // because the plugins endpoint didn't return an array.
+        const manifests = Array.isArray(list) ? list : [];
+        setManifests(manifests);
+        if (manifests.length === 0) setLoading(false);
       })
       .catch(() => setLoading(false));
   }, []);

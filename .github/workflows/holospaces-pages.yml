@@ -44,11 +44,10 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: package-lock.json
 
-      - name: Install dashboard deps
+      - name: Install workspace deps (web is an npm workspace; lockfile is at the root)
         run: npm ci
-        working-directory: web
 
       - name: Build + seal the app object (Vite base=./ → relock)
         run: tools/holo/build-app.sh
@@ -60,6 +59,24 @@ jobs:
         # Mirrors holospaces' V&V: vv/suites/ gate the deploy (green required), vv/targets/ are the
         # expected-RED specs for the unfinished stages and never block. See vv/README.md.
         run: vv/run.sh
+
+      - name: Browser e2e deps (Playwright + Chromium)
+        run: npm ci && npx playwright install --with-deps chromium
+        working-directory: vv/e2e
+
+      - name: Browser e2e gate (real Chromium against the assembled _site — FAIL-CLOSED)
+        # Verifies the deployed artifact in a real browser: the static shell renders (no /api 404), the
+        # content-verify Service Worker serves the Hermes app by κ, and the catalog lists the app.
+        run: npx playwright test
+        working-directory: vv/e2e
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: vv/e2e/playwright-report
+          retention-days: 7
 
       - uses: actions/configure-pages@v5
         with:

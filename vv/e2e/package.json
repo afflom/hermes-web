@@ -1,0 +1,14 @@
+{
+  "name": "hermes-holospace-e2e",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Browser e2e/integration gate for the Hermes holospace Pages deployment (Playwright).",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "install-browser": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.0"
+  }
+}

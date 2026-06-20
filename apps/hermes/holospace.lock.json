@@ -3,18 +3,18 @@
     "dcterms": "http://purl.org/dc/terms/",
     "holo": "https://hologram.os/ns#"
   },
-  "root": "did:holo:sha256:d7c463e335782959c0ae5f18240c8b1e794091049d5be614fbb493e7d62106b0",
+  "root": "did:holo:sha256:9329795a79eda6b5978a596293473b0f4d0a9ea9cdb08766f76cb49c13a629c8",
   "identifier": "foundation.uor.hermes",
   "algo": "sha256",
   "holo:within": "did:holo:sha256:f82435dab0215aa6695797d5e9ef4809f1905c015c419f085b2d42346441aad0",
   "holo:atlasCoordinate": {
     "space": "Φ-Atlas-12288",
     "within": "did:holo:sha256:f82435dab0215aa6695797d5e9ef4809f1905c015c419f085b2d42346441aad0",
-    "cell": 1712,
-    "page": 6,
-    "byte": 176,
-    "r96": 80,
-    "phi": 1712
+    "cell": 10696,
+    "page": 41,
+    "byte": 200,
+    "r96": 8,
+    "phi": 10696
   },
   "files": 25,
   "closure": {
@@ -99,13 +99,13 @@
         "did:holo:blake3:83c2c9b0068b52101d024c702e0bcb65f8d53543233de7b7bd1c054ebb4eb8c2"
       ]
     },
-    "apps/hermes/assets/index-Y6J38ldG.js": {
-      "kappa": "did:holo:sha256:0cf5fb6970dddfb430a5d455ed9b4c7af1a95a55e97eee7666572251110083aa",
-      "sri": "sha256-DPX7aXDd37QwpdRV7ZtMevGpWlXpfu52ZlciUREAg6o=",
-      "multibase": "uEiAM9ftpcN3ftDCl1FXtm0x68alaVel-7nZmVyJREQCDqg",
-      "bytes": 1913152,
+    "apps/hermes/assets/index-Crjmqh0d.js": {
+      "kappa": "did:holo:sha256:ed21cc4151b1930368bdb40d51000d4f0b980c099b542ebfe0bdd39b5af928a1",
+      "sri": "sha256-7SHMQVGxkwNovbQNUQANTwuYDAmbVC6/4L3Tm1r5KKE=",
+      "multibase": "uEiDtIcxBUbGTA2i9tA1RAA1PC5gMCZtULr_gvdObWvkooQ",
+      "bytes": 1914731,
       "alsoKnownAs": [
-        "did:holo:blake3:aa52162e6b3a44192e40663a361fff945da7b10e19af41d8d4bb9ef7566fdfd0"
+        "did:holo:blake3:922a333a2a8fa7f95d9cf359c561a14cc0f4e70e84c9418c2c69b5fb4f3ba152"
       ]
     },
     "apps/hermes/favicon.ico": {
@@ -226,12 +226,12 @@
       ]
     },
     "apps/hermes/index.html": {
-      "kappa": "did:holo:sha256:e215a5ec15989183d85461531f0cefa2f357eeb65c0f5c8bd7871c3dab2f9d5f",
-      "sri": "sha256-4hWl7BWYkYPYVGFTHwzvovNX7rZcD1yL14ccPasvnV8=",
-      "multibase": "uEiDiFaXsFZiRg9hUYVMfDO-i81futlwPXIvXhxw9qy-dXw",
+      "kappa": "did:holo:sha256:73c4c9fe0e6a0859f46dafa06c99f5bb1479b9743f648778f7fbba975deed8c5",
+      "sri": "sha256-c8TJ/g5qCFn0ba+gbJn1uxR5uXQ/ZId49/u6l13u2MU=",
+      "multibase": "uEiBzxMn-DmoIWfRtr6BsmfW7FHm5dD9kh3j3-7qXXe7YxQ",
       "bytes": 513,
       "alsoKnownAs": [
-        "did:holo:blake3:f894c9acca42e5860febd73c2a487ac6418905c95908778962e310a227a50849"
+        "did:holo:blake3:6074c2b9fe3ec86503edd0dd7376e94063f4aa3024ee0d065c42ab513a18b60a"
       ]
     },
     "_shared/holo-conscience.js": {

@@ -8,7 +8,11 @@ import { setFetchImpl, setSocketFactory } from "./api";
 // collection; everything else with an empty object. The shell renders "nothing yet" instead of erroring.
 function emptyStateFor(path: string): unknown {
   const p = path.split("?")[0];
-  if (/\/(sessions|skills|toolsets|logs|mcp|plugins|themes|fonts|webhooks|profiles|messaging\/platforms|automation|cron)\b/.test(p)) {
+  // Bare-array endpoints (the response IS a JSON array): an empty array, so `.map`/`.some`/`.length`
+  // and `for…of` all work in the shell. (e.g. GET /api/dashboard/plugins → PluginManifest[].)
+  if (/\/(dashboard\/plugins|models|themes|fonts|toolsets|skills)\b/.test(p)) return [];
+  // Wrapped-collection endpoints (the response is { items: [...] } or similar).
+  if (/\/(sessions|logs|mcp|plugins|webhooks|profiles|messaging\/platforms|automation|cron)\b/.test(p)) {
     return { items: [], sessions: [], skills: [], results: [], total: 0 };
   }
   if (p.endsWith("/status")) return { ok: true, static: true };

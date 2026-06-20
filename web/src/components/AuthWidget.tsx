@@ -35,7 +35,8 @@ interface AuthWidgetProps {
 /** Truncate ``user_id`` to fit a small UI without revealing the full
  *  opaque identifier. 14 chars is enough to disambiguate users in a
  *  small org and short enough to fit a single sidebar row. */
-function truncateUserId(id: string): string {
+function truncateUserId(id: string | undefined | null): string {
+  if (!id) return "";
   if (id.length <= 14) return id;
   return `${id.slice(0, 14)}…`;
 }
