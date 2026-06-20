@@ -88,3 +88,19 @@ jobs:
 
       - id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Smoke-test the LIVE deployment (same e2e against the deployed URL)
+        # End-to-end proof the published site works in a real browser, not just the pre-deploy artifact.
+        # Waits for Pages CDN propagation, then runs the e2e against the live page_url (Chromium already
+        # installed above). Relative test URLs resolve against the /<repo>/ project-site subpath.
+        run: |
+          URL="${{ steps.deployment.outputs.page_url }}"
+          echo "Waiting for $URL to serve the holospace frame…"
+          for i in $(seq 1 36); do
+            if curl -fsS "$URL" 2>/dev/null | grep -qE "holo-fhs-sw|Hologram OS"; then
+              echo "live after ${i} tries"; break
+            fi
+            sleep 5
+          done
+          E2E_BASE_URL="$URL" npx playwright test
+        working-directory: vv/e2e

@@ -4,8 +4,11 @@ import { test, expect } from "@playwright/test";
 // assembled `_site`. These verify the deployed artifact actually works in a browser — not just that the
 // files were produced.
 
-const HERMES_ENTRY = "/usr/share/holospaces/hermes/index.html"; // physical app entry (no SW needed)
-const HERMES_FLAT = "/apps/hermes/index.html"; // flat path — resolves ONLY through the SW's FHS mapping
+// Relative URLs (resolved against baseURL) so the same tests run against the local root-served _site and
+// the live /<repo>/ project-site subpath.
+const HERMES_ENTRY = "usr/share/holospaces/hermes/index.html"; // physical app entry (no SW needed)
+const HERMES_FLAT = "apps/hermes/index.html"; // flat path — resolves ONLY through the SW's FHS mapping
+const CATALOG = "usr/share/holospaces/index.jsonld";
 
 /** Wait until the dashboard's React root has mounted real content. */
 async function rootMounted(scope: { waitForFunction: (fn: string) => Promise<unknown> }) {
@@ -60,24 +63,28 @@ test("A. the Hermes dashboard renders the static shell with no /api 404 (served 
 test("B. the content-verify Service Worker serves the Hermes app by κ (flat path resolves only via SW)", async ({
   page,
 }) => {
-  await page.goto("/", { waitUntil: "load" });
+  await page.goto("./", { waitUntil: "load" });
 
   // The boot registers holo-fhs-sw.js and reloads/redirects to take control. Wait until it controls.
   expect(await waitForSWController(page), "Service Worker never took control of the page").toBe(true);
 
   // The flat URL has NO physical file (the app lives at usr/share/holospaces/hermes/index.html); it
-  // resolves ONLY through the SW's FHS map + κ re-derivation. A successful render proves the SW served it.
-  const resp = await page.goto(HERMES_FLAT, { waitUntil: "load" });
-  expect(resp, "no response for the SW-mapped flat path").not.toBeNull();
-  expect(resp!.status(), "SW did not serve the Hermes app entry").toBeLessThan(400);
-  // In static mode the κ-served app boots its no-backend shell.
-  await expect(page.getByTestId("holo-static-shell")).toBeVisible({ timeout: 30_000 });
+  // resolves ONLY through the SW's FHS map + κ re-derivation. FETCH it through the SW (a top-level
+  // navigation would be re-routed by the launcher, which mounts apps in iframes) and assert the SW
+  // returned the Hermes app entry HTML — proof the content-verify SW serves the app by κ.
+  const served = await page.evaluate(async (flat) => {
+    const r = await fetch(flat);
+    return { status: r.status, ctype: r.headers.get("content-type") || "", body: (await r.text()).slice(0, 4000) };
+  }, HERMES_FLAT);
+  expect(served.status, "SW did not serve the flat app-entry path").toBeLessThan(400);
+  expect(served.ctype, "SW-served entry is not HTML").toContain("text/html");
+  expect(served.body, "SW-served bytes are not the Hermes app entry").toMatch(/id="root"/);
 });
 
 test("C. the apps catalog lists the Hermes app with its sealed root κ", async ({ page }) => {
   // Fetch the catalog directly (no boot-chain navigation race). It is served as apps/index.jsonld via the
   // SW and physically at usr/share/holospaces/index.jsonld — the assembled artifact is the same bytes.
-  const r = await page.request.get("/usr/share/holospaces/index.jsonld");
+  const r = await page.request.get(CATALOG);
   expect(r.ok(), "apps catalog not served").toBeTruthy();
   const catalog = (await r.json()) as Record<string, unknown>;
   const ds = (catalog["dcat:dataset"] || catalog["@graph"] || []) as Record<string, unknown>[];
