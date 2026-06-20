@@ -1,10 +1,12 @@
 name: Deploy hermes-web to GitHub Pages
 
-# Builds the hermes-web dashboard and publishes it to GitHub Pages from the hermes-web branch. This is
-# JUST the dashboard — a static SPA at /<repo>/ (afflom.github.io/hermes-web/). With no backend on a
-# static host the dashboard renders its no-backend landing (transport=static, no /api calls). A real
-# Chromium e2e gates the deploy (the artifact renders Hermes, and is not a Hologram-OS frame), and the
-# live URL is smoke-tested after deploy.
+# Builds the hermes-web dashboard and publishes it to GitHub Pages from the hermes-web branch. The
+# dashboard's data plane is the real Hermes backend running IN THE BROWSER on the holospaces substrate
+# (a content-addressed RISC-V guest resumed from a banked warm κ; see docs/holospaces/architecture.md).
+# The vendored wasm + the warm-κ CAS (web/public/holo/) ride along as static assets. A real Chromium
+# e2e gates the deploy: the wasm runtime loads + re-derives κ; the dashboard renders (not a stub, not a
+# Hologram-OS frame); and — when a warm κ is published (E2E_EXPECT_HOLOGRAM=1) — the in-browser backend
+# resumes and authenticates end to end. The live URL is smoke-tested after deploy.
 
 on:
   push:
@@ -51,7 +53,16 @@ jobs:
         working-directory: e2e
 
       - name: Browser e2e gate (real Chromium against the built dashboard — FAIL-CLOSED)
-        run: npx playwright test
+        # When a warm-κ manifest shipped in the build, require the in-browser backend to resume +
+        # authenticate end to end (E2E_EXPECT_HOLOGRAM=1); otherwise the hologram test skips.
+        run: |
+          if [ -f ../web/dist-pages/holo/warm/manifest.json ]; then
+            echo "warm κ present — requiring the in-browser backend"
+            export E2E_EXPECT_HOLOGRAM=1
+          else
+            echo "no warm κ in this build — hologram backend test will skip"
+          fi
+          npx playwright test
         working-directory: e2e
 
       - name: Upload Playwright report on failure
@@ -83,5 +94,6 @@ jobs:
             fi
             sleep 5
           done
+          if [ -f ../web/dist-pages/holo/warm/manifest.json ]; then export E2E_EXPECT_HOLOGRAM=1; fi
           E2E_BASE_URL="$URL" npx playwright test
         working-directory: e2e
