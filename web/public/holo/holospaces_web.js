@@ -1758,6 +1758,32 @@ export class Workspace {
         return Workspace.__wrap(ret[0]);
     }
     /**
+     * Resume like [`resume_devcontainer_bridged`](Workspace::resume_devcontainer_bridged) — re-attach
+     * the loopback **ingress** bridge so the host can [`dial_guest`](Workspace::dial_guest) the warm
+     * dashboard — but ALSO re-attach a router-backed **egress** so the guest can reach the internet
+     * again. VirtIO networking is deliberately not part of the κ-snapshot (egress is a live, external
+     * transport — see [`Emulator::snapshot`]), so a resumed machine must have its network re-attached,
+     * exactly as a host re-establishes networking on wake. The page drains the guest's outbound frames
+     * with [`egress_outbound`](Workspace::egress_outbound) and feeds replies with
+     * [`egress_inbound`](Workspace::egress_inbound) — carried to the internet by a holospaces egress
+     * node (a WebSocket relay) or the local **router extension** (Direct Sockets), exactly as for a
+     * `*_routed_*` boot. This is the warm-start twin of
+     * [`boot_devcontainer_routed_opfs_streamed_bridged`](Workspace::boot_devcontainer_routed_opfs_streamed_bridged):
+     * the COMPLETE agent — its dashboard reachable over loopback AND its outbound model/tool/git calls
+     * reaching the network — resumed from a κ-snapshot with no cold boot.
+     * @param {Uint8Array} snapshot
+     * @returns {Workspace}
+     */
+    static resume_devcontainer_net_bridged(snapshot) {
+        const ptr0 = passArray8ToWasm0(snapshot, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.workspace_resume_devcontainer_net_bridged(ptr0, len0);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return Workspace.__wrap(ret[0]);
+    }
+    /**
      * Advance the running holospace by `budget` instructions (one chunk of the
      * boot or of servicing input). Returns `true` once the machine has halted
      * (powered off). Call repeatedly from a UI loop, rendering
