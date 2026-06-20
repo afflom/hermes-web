@@ -40,7 +40,10 @@ class InertSocket {
   onmessage: ((ev: MessageEvent) => void) | null = null;
   onclose: ((ev: CloseEvent) => void) | null = null;
   onerror: ((ev: Event) => void) | null = null;
-  constructor(public url: string) {}
+  url: string;
+  constructor(url: string) {
+    this.url = url;
+  }
   send(): void {}
   close(): void {
     this.readyState = 3;

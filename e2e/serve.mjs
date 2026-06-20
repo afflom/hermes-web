@@ -40,7 +40,10 @@ const server = createServer(async (req, res) => {
     try {
       s = await stat(file);
     } catch {
-      // SPA fallback: unknown non-asset paths serve index.html (client-side routing).
+      // SPA fallback: only EXTENSIONLESS routes (client paths like /models) serve index.html. Missing
+      // assets (.json/.wasm/.js/…) must 404 — matching GitHub Pages — so probes like the warm-κ
+      // manifest check see a real miss instead of HTML masquerading as JSON.
+      if (extname(urlPath)) { res.writeHead(404, { "Content-Type": "text/plain" }); res.end("404 " + urlPath); return; }
       file = join(ROOT, "index.html");
       try { s = await stat(file); } catch { res.writeHead(404, { "Content-Type": "text/plain" }); res.end("404 " + urlPath); return; }
     }
