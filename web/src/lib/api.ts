@@ -7,8 +7,13 @@
 // rebuild. Empty string means "served at root".
 function readBasePath(): string {
   if (typeof window === "undefined") return "";
-  const raw = window.__HERMES_BASE_PATH__ ?? "";
-  if (!raw) return "";
+  // The server build's Python backend injects __HERMES_BASE_PATH__ from X-Forwarded-Prefix. A static
+  // build (e.g. GitHub Pages at /<repo>/) has no backend to inject it, so fall back to the Vite base
+  // (import.meta.env.BASE_URL, e.g. "/hermes-web/") — that is the path the SPA is actually served under,
+  // so client routing and asset/API prefixes line up.
+  const injected = window.__HERMES_BASE_PATH__ ?? "";
+  const raw = injected || (import.meta.env.BASE_URL ?? "");
+  if (!raw || raw === "/") return "";
   // Normalise: ensure leading slash, strip trailing slash.
   const withLead = raw.startsWith("/") ? raw : `/${raw}`;
   return withLead.replace(/\/+$/, "");

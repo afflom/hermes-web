@@ -96,6 +96,7 @@ import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
 import type { Translations } from "@/i18n/types";
 import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
+import { RouteErrorBoundary } from "@/components/RouteErrorBoundary";
 import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
@@ -737,19 +738,21 @@ export default function App() {
                     "min-h-0 flex flex-1 flex-col",
                 )}
               >
-                <ProfileKeyedRoutes>
-                  <Routes>
-                    {routes.map(({ key, path, element }) => (
-                      <Route key={key} path={path} element={element} />
-                    ))}
-                    <Route
-                      path="*"
-                      element={
-                        <UnknownRouteFallback pluginsLoading={pluginsLoading} />
-                      }
-                    />
-                  </Routes>
-                </ProfileKeyedRoutes>
+                <RouteErrorBoundary resetKey={pathname}>
+                  <ProfileKeyedRoutes>
+                    <Routes>
+                      {routes.map(({ key, path, element }) => (
+                        <Route key={key} path={path} element={element} />
+                      ))}
+                      <Route
+                        path="*"
+                        element={
+                          <UnknownRouteFallback pluginsLoading={pluginsLoading} />
+                        }
+                      />
+                    </Routes>
+                  </ProfileKeyedRoutes>
+                </RouteErrorBoundary>
 
                 {embeddedChat &&
                   !chatOverriddenByPlugin &&
