@@ -1,18 +1,10 @@
-name: Deploy Hermes holospace to GitHub Pages
+name: Deploy hermes-web to GitHub Pages
 
-# Publishes the Hermes dashboard as a content-addressed holospace app object, folded into the vendored
-# os-holo frame (the in-browser content-verify Service Worker serves every byte by κ and refuses a
-# mismatch, Law L5). Models the holospaces/os-holo Pages config; the deployment branch is hermes-web
-# (this fork's default + Pages branch).
-#
-# Pipeline (documentation-as-code — the same scripts run locally and in CI):
-#   web npm ci → tools/holo/build-app.sh (Vite base=./ → place → relock seal)
-#             → tools/holo/assemble-site.mjs (fold app into os-closure + catalog → _site)
-#             → tools/holo/bdd.mjs (strict behaviour gate, FAIL-CLOSED) → deploy _site
-#
-# Serve at a ROOT site (a <user>.github.io / org page or a custom domain) so the frame's own absolute
-# refs (/_shared/…, /usr/…) resolve. The Hermes app itself is built base=./ and is subpath-safe; the
-# frame-level absolute-ref constraint is os-holo's own documented Pages follow-up, inherited unchanged.
+# Builds the hermes-web dashboard and publishes it to GitHub Pages from the hermes-web branch. This is
+# JUST the dashboard — a static SPA at /<repo>/ (afflom.github.io/hermes-web/). With no backend on a
+# static host the dashboard renders its no-backend landing (transport=static, no /api calls). A real
+# Chromium e2e gates the deploy (the artifact renders Hermes, and is not a Hologram-OS frame), and the
+# live URL is smoke-tested after deploy.
 
 on:
   push:
@@ -36,8 +28,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true # the vendored os-holo frame at holo/ supplies the seal primitives + SW
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -49,33 +39,27 @@ jobs:
       - name: Install workspace deps (web is an npm workspace; lockfile is at the root)
         run: npm ci
 
-      - name: Build + seal the app object (Vite base=./ → relock)
-        run: tools/holo/build-app.sh
+      - name: Build the dashboard (base=/hermes-web/, static no-backend build)
+        run: HERMES_HOLO_BASE=/hermes-web/ npx vite build --outDir dist-pages --emptyOutDir
+        working-directory: web
 
-      - name: Assemble the site (fold app into frame closure + catalog)
-        run: FRAME=holo APPS=apps OUT=_site node tools/holo/assemble-site.mjs hermes
-
-      - name: V&V gate (suites fail-closed; targets reported, non-gating)
-        # Mirrors holospaces' V&V: vv/suites/ gate the deploy (green required), vv/targets/ are the
-        # expected-RED specs for the unfinished stages and never block. See vv/README.md.
-        run: vv/run.sh
+      - name: SPA fallback (client-side routing on Pages)
+        run: cp web/dist-pages/index.html web/dist-pages/404.html
 
       - name: Browser e2e deps (Playwright + Chromium)
         run: npm ci && npx playwright install --with-deps chromium
-        working-directory: vv/e2e
+        working-directory: e2e
 
-      - name: Browser e2e gate (real Chromium against the assembled _site — FAIL-CLOSED)
-        # Verifies the deployed artifact in a real browser: the static shell renders (no /api 404), the
-        # content-verify Service Worker serves the Hermes app by κ, and the catalog lists the app.
+      - name: Browser e2e gate (real Chromium against the built dashboard — FAIL-CLOSED)
         run: npx playwright test
-        working-directory: vv/e2e
+        working-directory: e2e
 
       - name: Upload Playwright report on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: playwright-report
-          path: vv/e2e/playwright-report
+          path: e2e/playwright-report
           retention-days: 7
 
       - uses: actions/configure-pages@v5
@@ -84,23 +68,20 @@ jobs:
 
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: _site
+          path: web/dist-pages
 
       - id: deployment
         uses: actions/deploy-pages@v4
 
       - name: Smoke-test the LIVE deployment (same e2e against the deployed URL)
-        # End-to-end proof the published site works in a real browser, not just the pre-deploy artifact.
-        # Waits for Pages CDN propagation, then runs the e2e against the live page_url (Chromium already
-        # installed above). Relative test URLs resolve against the /<repo>/ project-site subpath.
         run: |
           URL="${{ steps.deployment.outputs.page_url }}"
-          echo "Waiting for $URL to serve the holospace frame…"
+          echo "Waiting for $URL to serve the dashboard…"
           for i in $(seq 1 36); do
-            if curl -fsS "$URL" 2>/dev/null | grep -qE "holo-fhs-sw|Hologram OS"; then
+            if curl -fsS "$URL" 2>/dev/null | grep -qiE "hermes|id=.root."; then
               echo "live after ${i} tries"; break
             fi
             sleep 5
           done
           E2E_BASE_URL="$URL" npx playwright test
-        working-directory: vv/e2e
+        working-directory: e2e
