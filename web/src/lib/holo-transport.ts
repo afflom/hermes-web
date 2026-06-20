@@ -22,7 +22,7 @@ import {
   maskKey,
   type WsFrame,
 } from "./holo-wire.mjs";
-import { setFetchImpl, setSocketFactory, resetTransport } from "./api";
+import { setFetchImpl, setSocketFactory, resetTransport, HERMES_BASE_PATH } from "./api";
 
 /** The host→guest loopback ingress surface. Mirrors holospaces-web `Workspace` (snake_case in the
  * wasm-bindgen export); `fromWorkspace` adapts it. A connection id is returned by `dialGuest`; the
@@ -63,11 +63,21 @@ export function fromWorkspace(ws: {
 const PUMP_BUDGET = 2_000_000; // instructions per tick (matches the CC-33 witness cadence)
 const MAX_TICKS = 4000;
 
-/** Extract the dashboard-relative path (+query) from a `${BASE}${path}` or absolute URL. */
+/** Extract the GUEST-relative path (+query) from a dashboard URL, stripping the deploy `base`. The
+ * dashboard prefixes every path with its base (e.g. `/hermes-web`, from `api.ts#BASE`), but the in-guest
+ * `web_server.py` serves UN-prefixed paths (`/api/...`, `/`). Without the strip, every request 404s
+ * inside the guest. Pure + exported so the deploy-critical base handling is unit-tested. */
+export function guestRelativePath(input: string, base: string): string {
+  let p: string;
+  if (/^[a-z]+:\/\//i.test(input)) { const u = new URL(input); p = u.pathname + u.search; }
+  else if (/^wss?:\/\//i.test(input)) { const u = new URL(input); p = u.pathname + u.search; }
+  else p = input.startsWith("/") ? input : "/" + input;
+  if (base && (p === base || p.startsWith(base + "/"))) p = p.slice(base.length) || "/";
+  return p;
+}
+
 function pathOf(input: string): string {
-  if (/^[a-z]+:\/\//i.test(input)) { const u = new URL(input); return u.pathname + u.search; }
-  if (/^wss?:\/\//i.test(input)) { const u = new URL(input); return u.pathname + u.search; }
-  return input.startsWith("/") ? input : "/" + input;
+  return guestRelativePath(input, HERMES_BASE_PATH); // "/hermes-web", or "" on the server build
 }
 
 /** A `fetch`-like over the bridge: one dial per request (Connection: close), pump until the response
