@@ -30,7 +30,9 @@ interface HsWorkspace {
 }
 
 export interface HologramBootProgress {
-  phase: "wasm" | "snapshot" | "resume" | "attach" | "token" | "ready" | "error";
+  // "disk" = streaming the guest disk into the OPFS κ-store (the off-heap, content-addressed path used
+  // when the warm machine's disk is too large to resume monolithically within the wasm32 budget).
+  phase: "wasm" | "snapshot" | "disk" | "resume" | "attach" | "token" | "ready" | "error";
   detail?: string;
   /** 0..1 within a phase that reports sub-progress (the snapshot fetch). */
   fraction?: number;

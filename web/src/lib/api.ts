@@ -350,9 +350,10 @@ export function openSocketFromUrl(url: string): WebSocket {
 
 // ── REST half of the transport seam ──────────────────────────────────
 // Every REST call in this module goes through `_fetchImpl`. The default is
-// the platform `fetch`; the static (no-backend) build swaps it for an inert
-// implementation that answers reads with empty state (see
-// `holo-static-transport.ts`), so a static Pages deploy never 404s `/api`.
+// the platform `fetch` (the server-hosted `origin` build talks to its real
+// /api backend). The Pages build swaps it for the hologram transport
+// (`holo-transport.ts`), which routes /api over the loopback bridge to the
+// real Hermes server running in the in-browser holospaces guest.
 export type FetchImpl = (url: string, init?: RequestInit) => Promise<Response>;
 let _fetchImpl: FetchImpl = (url, init) => fetch(url, init);
 

@@ -12,7 +12,6 @@
 //     out-dir   default web/public/holo/warm     (copied into the Pages build by Vite)
 //     kappa     the substrate κ-label (blake3:…); if omitted, computed via the `kappa_of` example.
 import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
-import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
@@ -54,15 +53,16 @@ if (!/^blake3:[0-9a-f]+$/.test(kappa)) {
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(path.join(outDir, "chunks"), { recursive: true });
 
+// The chunks are a pure transport framing of the content — no per-chunk hash. Integrity is the ONE
+// substrate check the browser makes: the reassembled whole must re-derive to `kappa` (Law L5).
 const chunks = [];
 let gzTotal = 0;
 for (let off = 0, i = 0; off < snapshot.length; off += CHUNK, i++) {
   const raw = snapshot.subarray(off, Math.min(off + CHUNK, snapshot.length));
   const name = String(i).padStart(5, "0");
-  const sha256 = createHash("sha256").update(raw).digest("hex");
   const gz = gzipSync(raw, { level: 9 });
   writeFileSync(path.join(outDir, "chunks", name), gz);
-  chunks.push({ name, sha256, size: raw.length });
+  chunks.push({ name, size: raw.length });
   gzTotal += gz.length;
   if (gz.length > 95 * 1024 * 1024) {
     console.error(`chunk-warm-kappa: chunk ${name} gzips to ${gz.length} bytes (> 95 MB) — lower CHUNK`);

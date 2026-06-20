@@ -1,39 +1,27 @@
-// holo-cas.ts — fetch the warm Hermes κ-snapshot the browser resumes, content-addressed and
-// verified by re-derivation (Law L5; ADR-019). The snapshot is the whole serving machine
-// (CPU+RAM+disk+9p) the native witness banked once (`tools/holo/witness/cc_hermes_guest.rs`); the
-// browser restores it with `Workspace.resume_devcontainer_bridged` — no kernel fetch, no rootfs
-// assembly, no ~24-min cold boot.
+// holo-cas.ts — fetch the warm Hermes κ-snapshot the browser resumes, addressed and verified ENTIRELY
+// by the substrate: a κ is a content address, and content is accepted only if re-deriving its κ
+// reproduces it (Law L5; ADR-019, "verify by re-derivation — an untrusted gateway is safe because
+// trust is in the math"). No foreign hashes, no trusted gateway.
 //
-// Two reasons it is shipped as content-addressed CHUNKS rather than one blob:
-//   1. GitHub hard-rejects any single file > 100 MB, so a multi-hundred-MB κ cannot be a lone asset.
-//   2. It is the substrate's own model — a κ is a content address; its chunks are content too, each
-//      pinned by its own digest and verified on read. An untrusted gateway (Pages, a CDN, OPFS) is
-//      safe because trust is in the math: bytes are accepted only if re-deriving their κ reproduces it.
+// The snapshot is the whole serving machine (CPU+RAM+disk+9p) the native witness banked once
+// (`tools/holo/witness/cc_hermes_guest.rs`); the browser restores it with
+// `Workspace.resume_devcontainer_bridged` — no kernel fetch, no rootfs assembly, no cold boot.
 //
-// Load order: OPFS cache (instant, L5-verified) → else fetch the manifest + chunks (each chunk
-// integrity-checked, the reassembled whole L5-verified against the substrate κ), then persist to OPFS
-// for next time. `kappa()` here is the wasm `hs.kappa` (substrate default axis = blake3), the SAME
-// function `holospaces::address` the banking step (`cargo run --example kappa_of`) records — so the
-// recorded κ and the in-browser re-derivation are the same label, and the verify is real.
-
-export interface WarmChunk {
-  /** File name under `warm/chunks/`. */
-  name: string;
-  /** Lowercase hex SHA-256 of the chunk's RAW (post-gunzip) bytes — per-chunk integrity. */
-  sha256: string;
-  /** Raw (post-gunzip) byte length of the chunk. */
-  size: number;
-}
+// It is shipped as ordered chunks only because GitHub hard-rejects any single file > 100 MB — the
+// chunks are a pure transport framing of the content. Their integrity is not asserted by any side
+// hash; it falls out of the ONE substrate check that matters: the reassembled whole must re-derive to
+// the recorded κ (`hs.kappa`, the substrate default axis = blake3 — the exact label the banking step
+// `cargo run --example kappa_of` records). Equal load order, equal bytes, equal κ.
 
 export interface WarmManifest {
-  /** The substrate κ-label of the whole snapshot (`blake3:<hex>`) — the Law-L5 target. */
+  /** The substrate κ-label of the whole snapshot (`blake3:<hex>`) — the only trust anchor. */
   kappa: string;
   /** Uncompressed snapshot length in bytes (sum of chunk sizes). */
   size: number;
   /** Whether each chunk is gzip-compressed on the wire (guest RAM is mostly zero → tiny). */
   chunkGzip: boolean;
   /** Ordered chunks; concatenating their raw bytes reconstructs the snapshot. */
-  chunks: WarmChunk[];
+  chunks: { name: string; size: number }[];
 }
 
 /** A `hs.kappa`-shaped re-derivation fn (substrate default axis, blake3). */
@@ -47,30 +35,18 @@ export interface WarmLoadProgress {
 }
 
 type OnProgress = (p: WarmLoadProgress) => void;
+type Bytes = Uint8Array<ArrayBuffer>;
 
 const OPFS_DIR = "holo-warm";
 
-// A Uint8Array explicitly backed by an ArrayBuffer (not SharedArrayBuffer) — what the DOM/Web Crypto
-// APIs require under TS's typed-array strictness.
-type Bytes = Uint8Array<ArrayBuffer>;
-
 async function gunzip(b: Uint8Array): Promise<Bytes> {
-  const ds = new DecompressionStream("gzip");
-  const stream = new Response(b as BodyInit).body!.pipeThrough(ds);
+  const stream = new Response(b as BodyInit).body!.pipeThrough(new DecompressionStream("gzip"));
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
 async function gzip(b: Uint8Array): Promise<Bytes> {
-  const cs = new CompressionStream("gzip");
-  const stream = new Response(b as BodyInit).body!.pipeThrough(cs);
+  const stream = new Response(b as BodyInit).body!.pipeThrough(new CompressionStream("gzip"));
   return new Uint8Array(await new Response(stream).arrayBuffer());
-}
-
-async function sha256Hex(b: Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", b as BufferSource);
-  return Array.from(new Uint8Array(digest))
-    .map((x) => x.toString(16).padStart(2, "0"))
-    .join("");
 }
 
 /** A filesystem-safe slug for an OPFS cache key derived from the κ-label. */
@@ -88,8 +64,8 @@ async function opfsDir(): Promise<FileSystemDirectoryHandle | null> {
   }
 }
 
-/** Read a previously-persisted snapshot from OPFS and L5-verify it; null on miss/corruption. */
-async function readCached(kappa: string, k: KappaFn, onProgress: OnProgress): Promise<Uint8Array | null> {
+/** Read a previously-persisted snapshot from OPFS and verify it by re-derivation; null on miss/corruption. */
+async function readCached(kappa: string, k: KappaFn, onProgress: OnProgress): Promise<Bytes | null> {
   const dir = await opfsDir();
   if (!dir) return null;
   try {
@@ -102,8 +78,7 @@ async function readCached(kappa: string, k: KappaFn, onProgress: OnProgress): Pr
       onProgress({ phase: "cache", fraction: 1, detail: "restored from local snapshot store" });
       return snapshot;
     }
-    // Tampered/corrupt — drop it so the fetch path repopulates.
-    await dir.removeEntry(cacheKey(kappa)).catch(() => {});
+    await dir.removeEntry(cacheKey(kappa)).catch(() => {}); // corrupt — drop so the fetch path repopulates
     return null;
   } catch {
     return null;
@@ -118,7 +93,7 @@ async function persistCache(kappa: string, snapshot: Uint8Array, onProgress: OnP
     const gz = await gzip(snapshot);
     const fh = await dir.getFileHandle(cacheKey(kappa), { create: true });
     const w = await fh.createWritable();
-    await w.write(gz);
+    await w.write(gz as BufferSource);
     await w.close();
   } catch {
     /* OPFS write is a best-effort cache; the resume already has its bytes. */
@@ -132,11 +107,11 @@ function warmUrl(rel: string): string {
 }
 
 /**
- * Load + verify the warm snapshot. OPFS cache first; otherwise fetch the manifest, then each chunk
- * (integrity-checked by its own SHA-256), reassemble, and L5-verify the whole against the substrate κ.
- * Throws if no manifest is published or verification fails. `kappa` is the wasm `hs.kappa`.
+ * Load + verify the warm snapshot. OPFS cache first; otherwise fetch the manifest, fetch each chunk,
+ * reassemble, and verify the whole by re-derivation against the substrate κ. Throws if no manifest is
+ * published or verification fails. `kappa` is the wasm `hs.kappa`.
  */
-export async function loadWarmSnapshot(kappa: KappaFn, onProgress: OnProgress = () => {}): Promise<Uint8Array> {
+export async function loadWarmSnapshot(kappa: KappaFn, onProgress: OnProgress = () => {}): Promise<Bytes> {
   onProgress({ phase: "manifest", detail: "fetching warm-κ manifest" });
   const res = await fetch(warmUrl("manifest.json"), { cache: "no-cache" });
   if (!res.ok) throw new Error(`no warm-κ manifest (${res.status}) — bank it with the guest witness + chunker`);
@@ -145,11 +120,11 @@ export async function loadWarmSnapshot(kappa: KappaFn, onProgress: OnProgress = 
     throw new Error("warm-κ manifest is malformed (missing kappa/chunks)");
   }
 
-  // Fast path: the exact snapshot already sits in OPFS, verified.
+  // Fast path: the exact snapshot already sits in OPFS, verified by re-derivation.
   const cached = await readCached(manifest.kappa, kappa, onProgress);
   if (cached) return cached;
 
-  // Fetch + verify each content-addressed chunk, then concatenate into the full snapshot.
+  // Fetch each chunk and concatenate into the full snapshot (pure transport framing).
   const snapshot = new Uint8Array(manifest.size);
   let offset = 0;
   for (let i = 0; i < manifest.chunks.length; i++) {
@@ -157,20 +132,16 @@ export async function loadWarmSnapshot(kappa: KappaFn, onProgress: OnProgress = 
     onProgress({ phase: "chunk", fraction: i / manifest.chunks.length, detail: `fetching warm machine ${i + 1}/${manifest.chunks.length}` });
     const cr = await fetch(warmUrl(`chunks/${c.name}`), { cache: "force-cache" });
     if (!cr.ok) throw new Error(`warm-κ chunk ${c.name} fetch failed (${cr.status})`);
-    let bytes = new Uint8Array(await cr.arrayBuffer());
-    if (manifest.chunkGzip) bytes = await gunzip(bytes);
-    // Per-chunk re-derivation: a chunk is accepted only if its bytes hash to the pinned digest.
-    if ((await sha256Hex(bytes)) !== c.sha256) {
-      throw new Error(`warm-κ chunk ${c.name} failed integrity (sha256 mismatch) — refusing tampered content`);
-    }
+    const bytes = manifest.chunkGzip ? await gunzip(new Uint8Array(await cr.arrayBuffer())) : new Uint8Array(await cr.arrayBuffer());
     if (bytes.length !== c.size) throw new Error(`warm-κ chunk ${c.name} size mismatch`);
     snapshot.set(bytes, offset);
     offset += bytes.length;
   }
   if (offset !== manifest.size) throw new Error(`warm-κ reassembly size mismatch (${offset} ≠ ${manifest.size})`);
 
-  // Law L5: the reassembled whole must re-derive to the recorded substrate κ, or it is not the warm
-  // machine the witness banked. This is the trust anchor — the gateway never has to be trusted.
+  // Law L5 — the SINGLE trust anchor: the reassembled whole must re-derive to the recorded substrate κ,
+  // or it is not the warm machine the witness banked. Corruption anywhere (a bad chunk, a truncated
+  // fetch, a tampering gateway) fails here. The gateway never has to be trusted.
   onProgress({ phase: "verify", detail: "verifying warm machine by re-derivation (Law L5)" });
   const derived = kappa(snapshot);
   if (derived !== manifest.kappa) {
