@@ -1,9 +1,0 @@
-<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-label="Hermes">
-  <circle cx="12" cy="3.5" r="1.25" fill="currentColor" stroke="none"/>
-  <path d="M12 5v15"/>
-  <path d="M8.5 19.5h7"/>
-  <path d="M12 6.5c-2.2-2.4-5-2.4-6.5-1 2 .3 3.4 1.4 4.2 2.8"/>
-  <path d="M12 6.5c2.2-2.4 5-2.4 6.5-1-2 .3-3.4 1.4-4.2 2.8"/>
-  <path d="M9 9c1.2 1.2 4.8 1.2 6 0"/>
-  <path d="M9.2 12c1.1 1.1 4.5 1.1 5.6 0"/>
-</svg>
