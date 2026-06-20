@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { bootHologramTransport, type HologramBootProgress } from "../lib/holo-hologram";
+import { HoloEgressPrompt } from "./HoloEgressPrompt";
 
 // HologramBoot — the gate in front of the dashboard on the Pages build. The data plane is the real
 // Hermes backend running in an in-browser holospaces RISC-V guest; it must be RESUMED from its warm κ
@@ -43,7 +44,13 @@ export function HologramBoot({ children }: { children: ReactNode }) {
     })();
   }, [attempt]);
 
-  if (ready) return <>{children}</>;
+  if (ready)
+    return (
+      <>
+        {children}
+        <HoloEgressPrompt />
+      </>
+    );
 
   // Pinned to the concrete `-base` theme tokens (with hard fallbacks): this screen renders OUTSIDE
   // ThemeProvider, where the lens-modulated `--foreground` is alpha-0 (invisible).
