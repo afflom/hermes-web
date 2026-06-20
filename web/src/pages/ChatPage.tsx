@@ -24,7 +24,7 @@ import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
-import { HERMES_BASE_PATH, buildWsAuthParam } from "@/lib/api";
+import { HERMES_BASE_PATH, buildWsAuthParam, openSocketFromUrl } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Copy, PanelRight, RotateCcw, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -611,7 +611,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       const authParam = await buildWsAuthParam();
       if (unmounting) return;
       const url = buildWsUrl(authParam, resumeParam, channel, scopedProfile);
-      const ws = new WebSocket(url);
+      const ws = openSocketFromUrl(url);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
 

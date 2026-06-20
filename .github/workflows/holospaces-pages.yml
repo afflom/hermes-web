@@ -1,0 +1,73 @@
+name: Deploy Hermes holospace to GitHub Pages
+
+# Publishes the Hermes dashboard as a content-addressed holospace app object, folded into the vendored
+# os-holo frame (the in-browser content-verify Service Worker serves every byte by κ and refuses a
+# mismatch, Law L5). Models the holospaces/os-holo Pages config; the deployment branch is hermes-web
+# (this fork's default + Pages branch).
+#
+# Pipeline (documentation-as-code — the same scripts run locally and in CI):
+#   web npm ci → tools/holo/build-app.sh (Vite base=./ → place → relock seal)
+#             → tools/holo/assemble-site.mjs (fold app into os-closure + catalog → _site)
+#             → tools/holo/bdd.mjs (strict behaviour gate, FAIL-CLOSED) → deploy _site
+#
+# Serve at a ROOT site (a <user>.github.io / org page or a custom domain) so the frame's own absolute
+# refs (/_shared/…, /usr/…) resolve. The Hermes app itself is built base=./ and is subpath-safe; the
+# frame-level absolute-ref constraint is os-holo's own documented Pages follow-up, inherited unchanged.
+
+on:
+  push:
+    branches: [hermes-web]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true # the vendored os-holo frame at holo/ supplies the seal primitives + SW
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dashboard deps
+        run: npm ci
+        working-directory: web
+
+      - name: Build + seal the app object (Vite base=./ → relock)
+        run: tools/holo/build-app.sh
+
+      - name: Assemble the site (fold app into frame closure + catalog)
+        run: FRAME=holo APPS=apps OUT=_site node tools/holo/assemble-site.mjs hermes
+
+      - name: V&V gate (suites fail-closed; targets reported, non-gating)
+        # Mirrors holospaces' V&V: vv/suites/ gate the deploy (green required), vv/targets/ are the
+        # expected-RED specs for the unfinished stages and never block. See vv/README.md.
+        run: vv/run.sh
+
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

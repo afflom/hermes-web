@@ -33,7 +33,12 @@ import { ModelReloadConfirm } from "@/components/ModelReloadConfirm";
 import { ReasoningPicker } from "@/components/ReasoningPicker";
 import { ToolCall, type ToolEntry } from "@/components/ToolCall";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
-import { api, HERMES_BASE_PATH, buildWsAuthParam } from "@/lib/api";
+import {
+  api,
+  HERMES_BASE_PATH,
+  buildWsAuthParam,
+  openSocketFromUrl,
+} from "@/lib/api";
 
 import { cn } from "@/lib/utils";
 import { AlertCircle, ChevronDown, RefreshCw } from "lucide-react";
@@ -245,7 +250,7 @@ export function ChatSidebar({
       }
       const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
       const qs = new URLSearchParams({ [authName]: authValue, channel });
-      ws = new WebSocket(
+      ws = openSocketFromUrl(
         `${proto}//${window.location.host}${HERMES_BASE_PATH}/api/events?${qs.toString()}`,
       );
 

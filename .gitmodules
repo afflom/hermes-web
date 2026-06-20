@@ -1,0 +1,3 @@
+[submodule "holo"]
+	path = holo
+	url = https://github.com/humuhumu33/os-holo

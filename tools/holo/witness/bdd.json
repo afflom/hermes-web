@@ -1,0 +1,44 @@
+{
+  "featureDir": "features/holospaces/stage-a-app-object.feature",
+  "features": [
+    {
+      "feature": "Stage A — Hermes as a holospace app object",
+      "file": "features/holospaces/stage-a-app-object.feature",
+      "scenarios": [
+        {
+          "name": "the sealed root κ is pinned for this build",
+          "tags": [
+            "@pinned"
+          ],
+          "pending": false,
+          "status": "passed",
+          "steps": [
+            {
+              "step": "Given the os-holo frame is vendored at \"holo\"",
+              "status": "passed"
+            },
+            {
+              "step": "And the Hermes app is sealed",
+              "status": "passed"
+            },
+            {
+              "step": "When I re-seal the app with relock",
+              "status": "passed"
+            },
+            {
+              "step": "Then the root κ equals \"did:holo:sha256:d7c463e335782959c0ae5f18240c8b1e794091049d5be614fbb493e7d62106b0\"",
+              "status": "passed"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "totals": {
+    "passed": 1,
+    "failed": 0,
+    "pending": 0,
+    "scenarios": 1
+  },
+  "ok": true
+}

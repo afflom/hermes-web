@@ -1,0 +1,11 @@
+{
+  "id": "foundation.uor.hermes",
+  "name": "Hermes",
+  "type": ["schema:SoftwareApplication", "schema:WebApplication"],
+  "summary": "Hermes agent dashboard, lifted to the Hologram substrate",
+  "entry": "index.html",
+  "icon": "icon.svg",
+  "applicationCategory": "DeveloperApplication",
+  "capabilities": { "storage": ["foundation.uor.hermes"] },
+  "accent": "#7defc9"
+}

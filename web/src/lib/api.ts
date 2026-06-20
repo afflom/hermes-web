@@ -100,7 +100,7 @@ export async function fetchJSON<T>(
   if (token) {
     setSessionHeader(headers, token);
   }
-  const res = await fetch(`${BASE}${url}`, {
+  const res = await _fetchImpl(`${BASE}${url}`, {
     ...init,
     headers,
     // ``credentials: 'include'`` so the cookie-auth path (gated mode) works
@@ -216,7 +216,7 @@ async function getSessionToken(): Promise<string> {
  * fetch a fresh ticket.
  */
 export async function getWsTicket(): Promise<{ ticket: string; ttl_seconds: number }> {
-  const res = await fetch(`${BASE}/api/auth/ws-ticket`, {
+  const res = await _fetchImpl(`${BASE}/api/auth/ws-ticket`, {
     method: "POST",
     credentials: "include",
   });
@@ -266,7 +266,7 @@ export async function authedFetch(
   if (token) {
     setSessionHeader(headers, token);
   }
-  return fetch(`${BASE}${url}`, {
+  return _fetchImpl(`${BASE}${url}`, {
     ...init,
     headers,
     credentials: init?.credentials ?? "include",
@@ -295,6 +295,75 @@ export async function buildWsUrl(
   const qs = new URLSearchParams(params ?? {});
   qs.set(authName, authValue);
   return `${proto}//${window.location.host}${BASE}${path}?${qs}`;
+}
+
+// ── The single WebSocket construction point (transport seam) ──────────
+// Every realtime endpoint in the dashboard (`/api/ws`, `/api/events`,
+// `/api/pty`, and any plugin socket) is opened through `openSocket`, so
+// there is exactly ONE place that (a) resolves the gated-mode single-use
+// ws ticket / loopback token via `buildWsUrl`, and (b) constructs the
+// transport. This is the lever for the holospace lift: the default factory
+// builds a real ``ws(s)://`` socket against the origin server, while the
+// `static` (no-backend shell) and `hologram` (in-guest web_server over the
+// emulator loopback bridge) transports swap the factory to redirect the
+// same calls without touching any component. Resolving auth here — and
+// ONLY here — also removes a latent double-mint of the single-use ws
+// ticket that per-call-site auth resolution risked.
+export type SocketFactory = (url: string) => WebSocket;
+
+let _socketFactory: SocketFactory = (url) => new WebSocket(url);
+
+/** Override the WebSocket constructor used by `openSocket` — the holospace
+ * transport swap point. Pass the default ``(url) => new WebSocket(url)`` to
+ * restore origin-server behavior. */
+export function setSocketFactory(factory: SocketFactory): void {
+  _socketFactory = factory;
+}
+
+/** Open a dashboard WebSocket through the active transport. ``path`` is the
+ * dashboard-relative path (e.g. ``"/api/pty"``); ``params`` are the
+ * non-auth query params — the auth param is appended exactly once by
+ * `buildWsUrl`. */
+export async function openSocket(
+  path: string,
+  params?: Record<string, string>,
+): Promise<WebSocket> {
+  return _socketFactory(await buildWsUrl(path, params));
+}
+
+/** Construct a dashboard WebSocket from a fully-built ``ws(s)://`` URL,
+ * through the active transport. Used by call sites that already resolved
+ * their own auth/query (the live-chat PTY, gateway, and events sockets) so
+ * the transport swap and the holospace lift have a single construction
+ * point without disturbing each site's auth handling. The default factory
+ * returns ``new WebSocket(url)``; the `hologram` transport parses the path
+ * from ``url`` and dials the in-guest `web_server.py` over the loopback
+ * bridge instead. */
+export function openSocketFromUrl(url: string): WebSocket {
+  return _socketFactory(url);
+}
+
+// ── REST half of the transport seam ──────────────────────────────────
+// Every REST call in this module goes through `_fetchImpl`. The default is
+// the platform `fetch`; the `hologram` transport swaps it for an HTTP/1.1
+// client over the emulator loopback bridge (see `holo-transport.ts`), so
+// the dashboard reaches the in-guest `web_server.py` with no origin server.
+export type FetchImpl = (url: string, init?: RequestInit) => Promise<Response>;
+let _fetchImpl: FetchImpl = (url, init) => fetch(url, init);
+
+/** Override the fetch implementation used by every `/api` REST call — the
+ * holospace transport swap point. Pass ``(u, i) => fetch(u, i)`` to restore
+ * origin-server behavior. */
+export function setFetchImpl(impl: FetchImpl): void {
+  _fetchImpl = impl;
+}
+
+/** Restore both transport halves (REST + sockets) to the origin-server
+ * defaults. Keeps the only ``new WebSocket`` / platform ``fetch`` in this
+ * module, so the rest of the tree has a single transport chokepoint. */
+export function resetTransport(): void {
+  _socketFactory = (url) => new WebSocket(url);
+  _fetchImpl = (url, init) => fetch(url, init);
 }
 
 /** Build a ``?profile=<name>`` query suffix, or "" when unset.
@@ -334,7 +403,7 @@ export const api = {
       allowUnauthorized: true,
     }),
   logout: () =>
-    fetch(`${BASE}/auth/logout`, {
+    _fetchImpl(`${BASE}/auth/logout`, {
       method: "POST",
       credentials: "include",
     }).then((r) => {

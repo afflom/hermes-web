@@ -102,3 +102,30 @@ acp_registry/
 .gitattributes
 .hadolint.yaml
 .mailmap
+
+# Holospaces lift: scratch clones, vendored frame, and build outputs — never part of the guest image.
+.holo-ref/
+holo/
+target/
+**/target/
+_site/
+web/dist-holo/
+vv/witness/
+.worktrees/
+apps/hermes/assets/
+
+# Holospaces lift: V&V framework, witnesses, and lift docs are NOT part of the Hermes package and must
+# never enter the guest image (vv/ also holds the multi-hundred-MB OCI tars). Excluding them keeps the
+# image small AND stabilizes the COPY cache so pip install caches across lift-doc edits.
+vv/
+features/
+docs/holospaces/
+tools/holo/
+.plans/
+# The dashboard UI source + docs site are build inputs, not guest-Python runtime — in the lift the UI
+# is the sealed app object (apps/hermes), served by the frame, so the guest doesn't carry web/ sources.
+web/
+website/
+
+# The guest dashboard (hermes dashboard --skip-build) needs the prebuilt UI dist to start + serve /api.
+!hermes_cli/web_dist

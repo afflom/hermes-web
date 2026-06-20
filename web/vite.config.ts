@@ -58,6 +58,24 @@ function hermesDevToken(): Plugin {
 }
 
 export default defineConfig({
+  // Base path for emitted asset URLs.
+  //   "/"  (default) — the server-hosted dashboard (`hermes_cli/web_server.py`)
+  //                    serves index.html for deep client-routed paths under an
+  //                    optional X-Forwarded-Prefix, so assets must be absolute.
+  //   "./" (HERMES_HOLO_BASE=./) — the holospace app object is mounted at a
+  //                    fixed `./apps/hermes/index.html` inside a sandboxed
+  //                    iframe (os-holo `holospace.html`), so relative asset refs
+  //                    resolve into the sealed κ-closure (Law L5). Set only by
+  //                    the holospace build (`tools/holo/build-app.sh`), never the
+  //                    server build, which would 404 on deep client routes.
+  base: process.env.HERMES_HOLO_BASE ?? "/",
+  define: {
+    // True only in the holospace app-object build (HERMES_HOLO_BASE set): mounted in the os-holo frame
+    // with NO co-located /api backend, so the transport bootstrap defaults to the static navigable shell
+    // (empty states, inert sockets) instead of `origin` when the launcher injects no guest bridge. The
+    // server build leaves this false → `origin` → the real Python `hermes dashboard` /api backend.
+    __HERMES_HOLO_BUILD__: JSON.stringify(process.env.HERMES_HOLO_BASE != null),
+  },
   plugins: [react(), tailwindcss(), hermesDevToken()],
   resolve: {
     alias: {

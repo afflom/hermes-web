@@ -7,6 +7,12 @@ import { I18nProvider } from "./i18n";
 import { exposePluginSDK } from "./plugins";
 import { ThemeProvider } from "./themes";
 import { HERMES_BASE_PATH } from "./lib/api";
+import { selectHoloTransport } from "./lib/holo-bootstrap";
+
+// Select the dashboard transport before anything renders or fetches: hologram (in-guest web_server
+// over the emulator loopback bridge), static (no-backend Pages shell), or origin (server-hosted — the
+// default when the holospace launcher injects no signal). A no-op for a normal server-hosted build.
+selectHoloTransport();
 
 // Expose the plugin SDK before rendering so plugins loaded via <script>
 // can access React, components, etc. immediately.
