@@ -5,29 +5,20 @@ import { detectEgressExtensionId, connectEgress, egressRuntimeAvailable } from "
 // the frame format (the substrate + extension own it); we test detection and the carrier shuttle.
 
 describe("detectEgressExtensionId", () => {
-  // Minimal document.documentElement stub (vitest env is "node"); the function only reads one attribute.
-  let attrs: Record<string, string>;
-  beforeEach(() => {
-    attrs = {};
-    (globalThis as unknown as { document: unknown }).document = {
-      documentElement: { getAttribute: (k: string) => (k in attrs ? attrs[k] : null) },
-    };
-  });
-  afterEach(() => {
-    delete (globalThis as unknown as { document?: unknown }).document;
-  });
+  // Runs in a REAL browser — use the real <html> the content script writes the beacon onto.
+  afterEach(() => document.documentElement.removeAttribute("data-holospaces-egress"));
 
   it("returns null when the extension hasn't announced", () => {
     expect(detectEgressExtensionId()).toBeNull();
   });
 
   it("reads the extension id from the content-script beacon", () => {
-    attrs["data-holospaces-egress"] = "abcdef123";
+    document.documentElement.setAttribute("data-holospaces-egress", "abcdef123");
     expect(detectEgressExtensionId()).toBe("abcdef123");
   });
 
   it("treats an empty attribute as absent", () => {
-    attrs["data-holospaces-egress"] = "";
+    document.documentElement.setAttribute("data-holospaces-egress", "");
     expect(detectEgressExtensionId()).toBeNull();
   });
 });

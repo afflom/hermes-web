@@ -14,6 +14,7 @@ const PHASE_LABEL: Record<HologramBootProgress["phase"], string> = {
   snapshot: "Fetching the warm Hermes machine",
   disk: "Streaming the guest disk to local storage",
   resume: "Resuming the warm machine",
+  egress: "Connecting the agent's network",
   attach: "Re-attaching the loopback transport",
   token: "Authenticating with the in-guest server",
   ready: "Ready",
