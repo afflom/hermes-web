@@ -81,6 +81,28 @@ test("B. the content-verify Service Worker serves the Hermes app by κ (flat pat
   expect(served.body, "SW-served bytes are not the Hermes app entry").toMatch(/id="root"/);
 });
 
+test("D. the launcher mounts the Hermes app and it renders (κ-verified, no SAFETY STOP)", async ({
+  page,
+}) => {
+  // The integration the others miss: the os-holo launcher must actually MOUNT Hermes. The authoritative
+  // frame's SW fails CLOSED — if the Hermes-folded closure isn't re-anchored (reseal-site), every request
+  // 409s and the launcher shows the "couldn't be verified / SAFETY STOP" refusal instead of the app.
+  await page.goto("./", { waitUntil: "load" });
+  expect(await waitForSWController(page), "Service Worker never took control of the page").toBe(true);
+
+  // The launcher projection mounts an app by its identity into a sandboxed iframe.
+  await page.goto("holospace.html?app=foundation.uor.hermes", { waitUntil: "load" });
+
+  // It must NOT be the κ-verification refusal page.
+  await expect(page.locator("body")).not.toContainText(/couldn.?t be verified|SAFETY STOP/i, {
+    timeout: 15_000,
+  });
+
+  // The app mounts in an iframe and the Hermes static shell renders inside it (the real user outcome).
+  const appFrame = page.frameLocator("iframe");
+  await expect(appFrame.getByTestId("holo-static-shell")).toBeVisible({ timeout: 30_000 });
+});
+
 test("C. the apps catalog lists the Hermes app with its sealed root κ", async ({ page }) => {
   // Fetch the catalog directly (no boot-chain navigation race). It is served as apps/index.jsonld via the
   // SW and physically at usr/share/holospaces/index.jsonld — the assembled artifact is the same bytes.

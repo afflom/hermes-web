@@ -119,3 +119,10 @@ writeFileSync(join(OUT, "holo-witness-assemble.json"), JSON.stringify(witness, n
 console.log(JSON.stringify(witness, null, 2));
 if (failed.length) fail("witness failed: " + failed.join(", "));
 console.log(`✓ assemble-site: ${OUT} ready — ${placed} app files, ${doc.apps.length} apps, ${doc.files} closure κ`);
+
+// Folding Hermes edited the catalog + os-closure (apps[] + closure), which drifts per-path pins AND
+// changes os-closure's own hash. The authoritative Hologram-OS Service Worker fails CLOSED (refuses
+// every request, 409) unless os-closure re-derives to its baked anchor. Re-seal the served image's
+// trust chain so the SW trusts and serves the Hermes-folded closure.
+process.env.OUT = OUT;
+await import("./reseal-site.mjs");
