@@ -146,7 +146,10 @@ export async function bootWorkerTransport(report: (p: HologramBootProgress) => v
         resolve();
       }, onProgress, reject);
     worker!.onerror = (e) => reject(new Error(`worker error: ${e.message}`));
-    send({ t: "boot", base: HERMES_BASE_PATH });
+    // OPFS disk paging is opt-in (?holo-resume=opfs): lower memory but currently slower than the
+    // default monolithic resume. The default ships the proven, fast path.
+    const opfs = typeof location !== "undefined" && new URLSearchParams(location.search).get("holo-resume") === "opfs";
+    send({ t: "boot", base: HERMES_BASE_PATH, opfs });
   });
 }
 

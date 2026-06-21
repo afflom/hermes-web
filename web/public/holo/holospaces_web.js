@@ -1784,6 +1784,25 @@ export class Workspace {
         return Workspace.__wrap(ret[0]);
     }
     /**
+     * Resume like [`resume_devcontainer_net_bridged`](Workspace::resume_devcontainer_net_bridged), but
+     * **stream the κ-snapshot from an OPFS file and page the guest disk into an OPFS κ-store** — so the
+     * multi-hundred-MB disk NEVER lands on the wasm heap. Only RAM + the sparse disk index stay
+     * resident, keeping the 1.44 GB warm machine well within the wasm32 budget (mobile-capable, far
+     * lower peak than the monolithic `&[u8]` resume). The worker writes the reassembled snapshot to
+     * `snapshot_handle` and supplies a fresh `disk_handle`; both are OPFS `FileSystemSyncAccessHandle`s
+     * (worker-only). Egress + loopback are re-attached exactly as the monolithic path.
+     * @param {FileSystemSyncAccessHandle} snapshot_handle
+     * @param {FileSystemSyncAccessHandle} disk_handle
+     * @returns {Workspace}
+     */
+    static resume_devcontainer_net_bridged_opfs(snapshot_handle, disk_handle) {
+        const ret = wasm.workspace_resume_devcontainer_net_bridged_opfs(snapshot_handle, disk_handle);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return Workspace.__wrap(ret[0]);
+    }
+    /**
      * Advance the running holospace by `budget` instructions (one chunk of the
      * boot or of servicing input). Returns `true` once the machine has halted
      * (powered off). Call repeatedly from a UI loop, rendering
@@ -2412,7 +2431,7 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 13, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h091698db9a8be138);
             return ret;
         },
@@ -2422,17 +2441,17 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 13, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h091698db9a8be138_2);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 13, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h091698db9a8be138_3);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 13, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h091698db9a8be138_4);
             return ret;
         },

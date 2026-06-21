@@ -10,7 +10,7 @@ use hologram_store_mem::MemKappaStore;
 use hologram_substrate_core::KappaStore;
 use holospaces::assembly::{assemble_ext4, Layer};
 use holospaces::emulator::net::NoEgress;
-use holospaces::emulator::{Emulator, Halt};
+use holospaces::emulator::{Emulator, Halt, SliceRead};
 use holospaces::machine::MachineSpec;
 use holospaces::oci::{ingest_image, IngestedImage, OciError};
 
@@ -134,4 +134,69 @@ fn a_resumed_guest_still_serves_over_loopback() {
     // The KEY assertion: the RESUMED guest still serves over loopback (its negotiated device survived).
     assert_serves(&mut resumed, "after resume");
     eprintln!("[resume-serve-fast] ✓✓ serve-after-resume holds");
+}
+
+/// STREAMING resume: restore the clean κ via `restore_net_streamed` (paging the disk into a κ-store
+/// instead of a monolithic in-RAM image) and prove the resumed guest still SERVES over loopback. This
+/// is the substrate half of the browser's OPFS-κ-store path — same machine, disk off the heap.
+#[test]
+#[ignore]
+fn a_streamed_resume_serves_over_loopback() {
+    let store = MemKappaStore::new();
+    let img = match ingest(&store) {
+        Ok(i) => i,
+        Err(_) => {
+            eprintln!("SKIP: CC-21 image not present");
+            return;
+        }
+    };
+    let blobs: Vec<(String, Vec<u8>)> = img
+        .layers()
+        .iter()
+        .zip(img.layer_media_types())
+        .map(|(k, mt)| (mt.clone(), store.get(k).unwrap().unwrap().as_ref().to_vec()))
+        .collect();
+    let layers: Vec<Layer> = blobs.iter().map(|(mt, b)| Layer { media_type: mt, blob: b }).collect();
+    let rootfs = assemble_ext4(&layers).expect("assemble rootfs");
+    let kernel = gunzip(&cc16_dir().join("kernel/Image.gz"));
+
+    let spec = MachineSpec::devcontainer_net();
+    let base = spec.base;
+    let mut emu = spec.boot_net(&kernel, rootfs, Box::new(NoEgress)).expect("boot");
+    assert!(emu.enable_loopback());
+    let mut listening = false;
+    for _ in 0..400 {
+        if !matches!(emu.run(5_000_000), Halt::OutOfBudget) {
+            break;
+        }
+        if String::from_utf8_lossy(emu.console()).contains("SERVER-LISTENING") {
+            listening = true;
+            break;
+        }
+    }
+    assert!(listening, "server listened");
+
+    let snapshot = emu.snapshot();
+    drop(emu);
+
+    // The streamed restore reads the snapshot sequentially and pages the disk into a (here in-memory,
+    // OPFS in the browser) κ-store — the disk image is never materialized whole.
+    let mut reader = SliceRead::new(&snapshot);
+    let mut resumed = Emulator::restore_net_streamed(base, &mut reader, Box::new(MemKappaStore::new()))
+        .expect("streamed restore");
+    // Cross-check: the streamed restore reconstructs the SAME machine as the monolithic restore.
+    let mono = Emulator::restore(base, &snapshot).expect("monolithic restore");
+    assert_eq!(
+        holospaces::oci::sha256_digest(&resumed.snapshot()),
+        holospaces::oci::sha256_digest(&mono.snapshot()),
+        "streamed restore reconstructs a byte-identical machine"
+    );
+
+    resumed.reattach_net_egress(Box::new(NoEgress));
+    assert!(resumed.enable_loopback());
+    for _ in 0..50 {
+        resumed.run(2_000_000);
+    }
+    assert_serves(&mut resumed, "streamed resume");
+    eprintln!("[resume-serve-fast] ✓✓ STREAMED resume serves over loopback (disk off-heap)");
 }

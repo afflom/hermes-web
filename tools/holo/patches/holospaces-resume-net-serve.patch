@@ -1,8 +1,74 @@
 diff --git a/crates/holospaces-web/src/lib.rs b/crates/holospaces-web/src/lib.rs
-index bed80bd..19c14bb 100644
+index bed80bd..7b58881 100644
 --- a/crates/holospaces-web/src/lib.rs
 +++ b/crates/holospaces-web/src/lib.rs
-@@ -1342,6 +1342,45 @@ impl Workspace {
+@@ -47,7 +47,64 @@ use holospaces::assembly::{assemble_ext4, assemble_ext4_bootable, Layer};
+ use holospaces::boot::{devcontainer, provision, LifecycleError, ReadVerify, Resolver, Session};
+ use holospaces::config::{Configuration, Directive, LifecycleAction};
+ use holospaces::content_net::ContentPeer;
+-use holospaces::emulator::{aarch64, net, Emulator, Halt};
++use holospaces::emulator::{aarch64, net, Emulator, Halt, SnapshotError, StreamRead};
++
++/// A [`StreamRead`] over an OPFS file (the reassembled κ-snapshot the worker wrote). Reads sequentially
++/// via the sync access handle so `restore_net_streamed` never holds the whole 1.44 GB in the wasm heap.
++struct OpfsReader {
++    handle: web_sys::FileSystemSyncAccessHandle,
++    pos: f64,
++    size: f64,
++}
++impl OpfsReader {
++    fn new(handle: web_sys::FileSystemSyncAccessHandle) -> Result<Self, JsValue> {
++        let size = handle.get_size()?;
++        Ok(OpfsReader { handle, pos: 0.0, size })
++    }
++}
++impl StreamRead for OpfsReader {
++    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), SnapshotError> {
++        if self.pos + buf.len() as f64 > self.size {
++            return Err(SnapshotError::Truncated);
++        }
++        // The sync access handle can return a short read; loop until `buf` is full.
++        let mut filled = 0usize;
++        while filled < buf.len() {
++            let opts = web_sys::FileSystemReadWriteOptions::new();
++            opts.set_at(self.pos + filled as f64);
++            let n = self
++                .handle
++                .read_with_u8_array_and_options(&mut buf[filled..], &opts)
++                .map_err(|_| SnapshotError::Truncated)? as usize;
++            if n == 0 {
++                return Err(SnapshotError::Truncated);
++            }
++            filled += n;
++        }
++        self.pos += buf.len() as f64;
++        Ok(())
++    }
++    fn read_to_end(&mut self) -> Result<Vec<u8>, SnapshotError> {
++        let remaining = (self.size - self.pos) as usize;
++        let mut v = vec![0u8; remaining];
++        let mut filled = 0usize;
++        while filled < remaining {
++            let opts = web_sys::FileSystemReadWriteOptions::new();
++            opts.set_at(self.pos + filled as f64);
++            let n = self
++                .handle
++                .read_with_u8_array_and_options(&mut v[filled..], &opts)
++                .map_err(|_| SnapshotError::Truncated)? as usize;
++            if n == 0 {
++                break;
++            }
++            filled += n;
++        }
++        v.truncate(filled);
++        self.pos = self.size;
++        Ok(v)
++    }
++}
+ use holospaces::identity::{Operator, Roster};
+ use holospaces::machine::MachineSpec;
+ use holospaces::oci::ImagePull;
+@@ -1342,6 +1399,45 @@ impl Workspace {
          })
      }
  
@@ -48,7 +114,7 @@ index bed80bd..19c14bb 100644
      /// Drain the next egress frame the guest produced, for the page to carry to
      /// the router. `undefined` when none is queued (or this is not a routed boot).
      #[must_use]
-@@ -1389,6 +1428,61 @@ impl Workspace {
+@@ -1389,6 +1485,90 @@ impl Workspace {
          })
      }
  
@@ -107,14 +173,90 @@ index bed80bd..19c14bb 100644
 +        })
 +    }
 +
++    /// Resume like [`resume_devcontainer_net_bridged`](Workspace::resume_devcontainer_net_bridged), but
++    /// **stream the κ-snapshot from an OPFS file and page the guest disk into an OPFS κ-store** — so the
++    /// multi-hundred-MB disk NEVER lands on the wasm heap. Only RAM + the sparse disk index stay
++    /// resident, keeping the 1.44 GB warm machine well within the wasm32 budget (mobile-capable, far
++    /// lower peak than the monolithic `&[u8]` resume). The worker writes the reassembled snapshot to
++    /// `snapshot_handle` and supplies a fresh `disk_handle`; both are OPFS `FileSystemSyncAccessHandle`s
++    /// (worker-only). Egress + loopback are re-attached exactly as the monolithic path.
++    pub fn resume_devcontainer_net_bridged_opfs(
++        snapshot_handle: web_sys::FileSystemSyncAccessHandle,
++        disk_handle: web_sys::FileSystemSyncAccessHandle,
++    ) -> Result<Workspace, JsValue> {
++        let base = MachineSpec::devcontainer().base;
++        let mut reader = OpfsReader::new(snapshot_handle)?;
++        let disk_store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
++        let mut machine = Emulator::restore_net_streamed(base, &mut reader, disk_store).map_err(js_err)?;
++        let (egress, router) = net::ChannelEgress::new();
++        machine.reattach_net_egress(Box::new(egress));
++        machine.enable_loopback();
++        Ok(Workspace {
++            machine,
++            store: MemKappaStore::new(),
++            channel: Vec::new(),
++            files: std::collections::BTreeMap::new(),
++            halted: false,
++            console_cursor: 0,
++            router: Some(router),
++        })
++    }
++
      /// Advance the running holospace by `budget` instructions (one chunk of the
      /// boot or of servicing input). Returns `true` once the machine has halted
      /// (powered off). Call repeatedly from a UI loop, rendering
 diff --git a/crates/holospaces/src/emulator.rs b/crates/holospaces/src/emulator.rs
-index 876b044..4504503 100644
+index 876b044..86f4a40 100644
 --- a/crates/holospaces/src/emulator.rs
 +++ b/crates/holospaces/src/emulator.rs
-@@ -2129,6 +2129,24 @@ impl Emulator {
+@@ -597,6 +597,46 @@ impl<'a> SnapshotReader<'a> {
+     }
+ }
+ 
++/// A sequential byte source for **streaming restore** ([`Emulator::restore_net_streamed`]) — a slice
++/// cursor natively/in tests, an OPFS file handle in the browser peer. It lets a resumed machine read its
++/// κ-snapshot WITHOUT ever holding the whole 1.44 GB in the wasm heap: the big disk section streams
++/// sector-by-sector into a (possibly OPFS-backed) κ-store, and only RAM + the sparse disk index stay
++/// resident. `read_exact` fills `buf` from the current position; `read_to_end` returns the remainder.
++pub trait StreamRead {
++    /// Fill `buf` completely from the current position, advancing it; error if fewer bytes remain.
++    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), SnapshotError>;
++    /// Return all bytes from the current position to the end (the trailing RAM image).
++    fn read_to_end(&mut self) -> Result<Vec<u8>, SnapshotError>;
++}
++
++/// A [`StreamRead`] over an in-memory slice (native + the differential tests).
++pub struct SliceRead<'a> {
++    bytes: &'a [u8],
++    pos: usize,
++}
++impl<'a> SliceRead<'a> {
++    #[must_use]
++    pub fn new(bytes: &'a [u8]) -> Self {
++        SliceRead { bytes, pos: 0 }
++    }
++}
++impl StreamRead for SliceRead<'_> {
++    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), SnapshotError> {
++        let end = self.pos.checked_add(buf.len()).ok_or(SnapshotError::Truncated)?;
++        if end > self.bytes.len() {
++            return Err(SnapshotError::Truncated);
++        }
++        buf.copy_from_slice(&self.bytes[self.pos..end]);
++        self.pos = end;
++        Ok(())
++    }
++    fn read_to_end(&mut self) -> Result<Vec<u8>, SnapshotError> {
++        let v = self.bytes[self.pos..].to_vec();
++        self.pos = self.bytes.len();
++        Ok(v)
++    }
++}
++
+ /// The RISC-V **PLIC** — priority per source, a pending latch, per-context
+ /// enable bits and a priority threshold, and the claim/complete handshake
+ /// (RISC-V PLIC spec). Only the sources holospaces wires (the VirtIO IRQ) are
+@@ -2129,6 +2169,24 @@ impl Emulator {
          self.virtionet = Some(VirtioNet::new(egress, Box::new(net::NoIngress)));
      }
  
@@ -139,7 +281,7 @@ index 876b044..4504503 100644
      /// Attach the network device with both an `egress` (outbound) and an
      /// `ingress` (forwarded-port inbound) transport (`CC-16` + `CC-21`). A server
      /// the devcontainer runs on a forwarded port is then reachable from outside
-@@ -2679,10 +2697,36 @@ impl Emulator {
+@@ -2679,10 +2737,36 @@ impl Emulator {
                  dev.fs.snapshot_into(&mut out);
              }
          }
@@ -180,7 +322,7 @@ index 876b044..4504503 100644
          out.extend_from_slice(&self.ram);
          out
      }
-@@ -2817,6 +2861,52 @@ impl Emulator {
+@@ -2817,10 +2901,210 @@ impl Emulator {
                  })
              }
          };
@@ -233,7 +375,165 @@ index 876b044..4504503 100644
          emu.ram = r.rest().to_vec();
          Ok(emu)
      }
-@@ -3118,6 +3208,31 @@ impl Emulator {
+ 
++    fn sr_u8<R: StreamRead>(r: &mut R) -> Result<u8, SnapshotError> { let mut b = [0u8; 1]; r.read_exact(&mut b)?; Ok(b[0]) }
++    fn sr_u16<R: StreamRead>(r: &mut R) -> Result<u16, SnapshotError> { let mut b = [0u8; 2]; r.read_exact(&mut b)?; Ok(u16::from_le_bytes(b)) }
++    fn sr_u32<R: StreamRead>(r: &mut R) -> Result<u32, SnapshotError> { let mut b = [0u8; 4]; r.read_exact(&mut b)?; Ok(u32::from_le_bytes(b)) }
++    fn sr_u64<R: StreamRead>(r: &mut R) -> Result<u64, SnapshotError> { let mut b = [0u8; 8]; r.read_exact(&mut b)?; Ok(u64::from_le_bytes(b)) }
++    fn sr_vec<R: StreamRead>(r: &mut R, n: usize) -> Result<Vec<u8>, SnapshotError> { let mut v = vec![0u8; n]; r.read_exact(&mut v)?; Ok(v) }
++
++    /// **Streaming** twin of [`Emulator::restore`]: parse the κ-snapshot from `r`, paging the disk image
++    /// sector-by-sector into `disk_store` (e.g. an OPFS-backed κ-store) so the multi-hundred-MB disk
++    /// NEVER lands on the wasm heap — only RAM + the sparse disk index stay resident, keeping the
++    /// 1.44 GB warm machine well within the wasm32 budget (mobile-capable, lower peak). Supports the
++    /// no-9p machines [`MachineSpec::boot_net`] produces (Hermes); a populated 9p section is rejected
++    /// (it can't stream here). Byte-for-byte the same format as [`Emulator::restore`].
++    pub fn restore_net_streamed<R: StreamRead>(
++        base: u64,
++        r: &mut R,
++        disk_store: Box<dyn KappaStore>,
++    ) -> Result<Self, SnapshotError> {
++        let mut emu = Self::new(base, 0);
++        emu.hart.pc = Self::sr_u64(r)?;
++        for x in &mut emu.hart.x {
++            *x = Self::sr_u64(r)?;
++        }
++        for f in &mut emu.hart.f {
++            *f = Self::sr_u64(r)?;
++        }
++        let csr_count = Self::sr_u32(r)?;
++        emu.csrs.clear();
++        for _ in 0..csr_count {
++            let csr = Self::sr_u32(r)?;
++            let value = Self::sr_u64(r)?;
++            emu.csrs.insert(csr, value);
++        }
++        emu.priv_level = Self::sr_u8(r)?;
++        emu.provide_sbi = Self::sr_u8(r)? != 0;
++        emu.msip = Self::sr_u8(r)? != 0;
++        let reservation = Self::sr_u64(r)?;
++        emu.reservation = (reservation != u64::MAX).then_some(reservation);
++        emu.mtime = Self::sr_u64(r)?;
++        emu.mtimecmp = Self::sr_u64(r)?;
++        let console_in_len = Self::sr_u64(r)? as usize;
++        emu.console_in = Self::sr_vec(r, console_in_len)?;
++        emu.in_cursor = Self::sr_u64(r)? as usize;
++        for p in &mut emu.plic.priority {
++            *p = Self::sr_u32(r)?;
++        }
++        emu.plic.pending = Self::sr_u32(r)?;
++        for e in &mut emu.plic.enable {
++            *e = Self::sr_u32(r)?;
++        }
++        for t in &mut emu.plic.threshold {
++            *t = Self::sr_u32(r)?;
++        }
++        emu.virtio = match Self::sr_u8(r)? {
++            0 => None,
++            _ => {
++                let status = Self::sr_u32(r)?;
++                let device_features_sel = Self::sr_u32(r)?;
++                let driver_features_sel = Self::sr_u32(r)?;
++                let driver_features = [Self::sr_u32(r)?, Self::sr_u32(r)?];
++                let queue_sel = Self::sr_u32(r)?;
++                let queue_num = Self::sr_u32(r)?;
++                let queue_ready = Self::sr_u32(r)?;
++                let desc_addr = Self::sr_u64(r)?;
++                let avail_addr = Self::sr_u64(r)?;
++                let used_addr = Self::sr_u64(r)?;
++                let last_avail = Self::sr_u16(r)?;
++                let interrupt_status = Self::sr_u32(r)?;
++                let irq_pending = Self::sr_u8(r)? != 0;
++                let disk_len = Self::sr_u64(r)? as usize;
++                // Stream the disk image sector-by-sector into the (OPFS-backed) store — never resident.
++                let sector_count = disk_len.div_ceil(DISK_SECTOR) as u64;
++                let mut remaining = disk_len;
++                let mut read_err: Result<(), SnapshotError> = Ok(());
++                let disk = KappaBacking::from_sectors(disk_store, sector_count, |_i, buf| {
++                    let n = remaining.min(DISK_SECTOR);
++                    if read_err.is_ok() {
++                        if let Err(e) = r.read_exact(&mut buf[..n]) {
++                            read_err = Err(e);
++                        }
++                    }
++                    remaining -= n;
++                });
++                read_err?;
++                Some(VirtioBlk {
++                    disk,
++                    status,
++                    device_features_sel,
++                    driver_features_sel,
++                    driver_features,
++                    queue_sel,
++                    queue_num,
++                    queue_ready,
++                    desc_addr,
++                    avail_addr,
++                    used_addr,
++                    last_avail,
++                    interrupt_status,
++                    irq_pending,
++                })
++            }
++        };
++        // boot_net machines (Hermes) carry no 9p; a populated 9p fs can't be streamed here.
++        if Self::sr_u8(r)? != 0 {
++            return Err(SnapshotError::Malformed);
++        }
++        emu.virtio9p = None;
++        emu.virtionet = match Self::sr_u8(r)? {
++            0 => None,
++            _ => {
++                let mut mac = [0u8; 6];
++                for b in &mut mac {
++                    *b = Self::sr_u8(r)?;
++                }
++                let status = Self::sr_u32(r)?;
++                let device_features_sel = Self::sr_u32(r)?;
++                let driver_features_sel = Self::sr_u32(r)?;
++                let driver_features = [Self::sr_u32(r)?, Self::sr_u32(r)?];
++                let queue_sel = Self::sr_u32(r)?;
++                let mut queue_num = [0u32; 2];
++                let mut queue_ready = [0u32; 2];
++                let mut desc_addr = [0u64; 2];
++                let mut avail_addr = [0u64; 2];
++                let mut used_addr = [0u64; 2];
++                let mut last_avail = [0u16; 2];
++                for q in 0..2 {
++                    queue_num[q] = Self::sr_u32(r)?;
++                    queue_ready[q] = Self::sr_u32(r)?;
++                    desc_addr[q] = Self::sr_u64(r)?;
++                    avail_addr[q] = Self::sr_u64(r)?;
++                    used_addr[q] = Self::sr_u64(r)?;
++                    last_avail[q] = Self::sr_u16(r)?;
++                }
++                let interrupt_status = Self::sr_u32(r)?;
++                let mut net = VirtioNet::new(Box::new(net::NoEgress), Box::new(net::NoIngress));
++                net.mac = mac;
++                net.status = status;
++                net.device_features_sel = device_features_sel;
++                net.driver_features_sel = driver_features_sel;
++                net.driver_features = driver_features;
++                net.queue_sel = queue_sel;
++                net.queue_num = queue_num;
++                net.queue_ready = queue_ready;
++                net.desc_addr = desc_addr;
++                net.avail_addr = avail_addr;
++                net.used_addr = used_addr;
++                net.last_avail = last_avail;
++                net.interrupt_status = interrupt_status;
++                Some(net)
++            }
++        };
++        emu.ram = r.read_to_end()?;
++        Ok(emu)
++    }
++
+     /// Run until the guest exits, traps, or `max_steps` is reached.
+     pub fn run(&mut self, max_steps: u64) -> Halt {
+         for _ in 0..max_steps {
+@@ -3118,6 +3402,31 @@ impl Emulator {
      /// any pending receive frames into the guest's receive queue. Called
      /// periodically from the run loop (so host data arrives without the guest
      /// having to transmit first). Delegates to the shared [`devbus`].

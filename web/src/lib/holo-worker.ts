@@ -14,10 +14,29 @@ import type { EgressChannel } from "./holo-egress";
 import type { ToWorker, FromWorker } from "./holo-protocol";
 import type { HologramBootProgress } from "./holo-hologram-types";
 
+interface SyncAccessHandle {
+  write(buf: Uint8Array, opts?: { at?: number }): number;
+  truncate(n: number): void;
+  flush(): void;
+  close(): void;
+  getSize(): number;
+}
 interface HsModule {
   default: (input?: unknown) => Promise<unknown>;
   kappa: (bytes: Uint8Array) => string;
-  Workspace: { resume_devcontainer_net_bridged: (snapshot: Uint8Array) => HoloWorkspace };
+  Workspace: {
+    resume_devcontainer_net_bridged: (snapshot: Uint8Array) => HoloWorkspace;
+    resume_devcontainer_net_bridged_opfs: (snapshot: SyncAccessHandle, disk: SyncAccessHandle) => HoloWorkspace;
+  };
+}
+
+/** Create a truncated OPFS sync access handle (worker-only) for `name`. */
+async function opfsHandle(name: string): Promise<SyncAccessHandle> {
+  const root = await navigator.storage.getDirectory();
+  const fh = await root.getFileHandle(name, { create: true });
+  const h = (await (fh as unknown as { createSyncAccessHandle: () => Promise<SyncAccessHandle> }).createSyncAccessHandle());
+  h.truncate(0);
+  return h;
 }
 
 const GUEST_PORT = 9119;
@@ -38,7 +57,7 @@ let runtime: BridgeRuntime | null = null;
 let egressInbound: ((f: Uint8Array) => void) | null = null;
 const sockets = new Map<number, RuntimeSocket>();
 
-async function boot(): Promise<void> {
+async function boot(useOpfs: boolean): Promise<void> {
   const report = (p: HologramBootProgress) => post({ t: "progress", p });
 
   report({ phase: "wasm", detail: "loading the holospaces runtime" });
@@ -46,14 +65,40 @@ async function boot(): Promise<void> {
   await hs.default();
 
   report({ phase: "snapshot", detail: "fetching the warm Hermes machine" });
-  const snapshot = await loadWarmSnapshot(
+  let snapshot = await loadWarmSnapshot(
     (b) => hs.kappa(b),
     (p: WarmLoadProgress) =>
       report({ phase: p.phase === "verify" || p.phase === "persist" ? "resume" : "snapshot", detail: p.detail, fraction: p.fraction }),
   );
 
-  report({ phase: "resume", detail: "resuming the warm machine (no cold boot)" });
-  const ws = hs.Workspace.resume_devcontainer_net_bridged(snapshot);
+  // OPFS-κ-store path: stage the snapshot in OPFS, FREE the JS copy, then resume with the disk paged
+  // into an OPFS store — so the multi-hundred-MB disk never lands on the wasm heap (mobile-capable,
+  // ~700 MB resident vs ~2.7 GB). Only the OPFS *setup* is fallible (sync access handles are worker-
+  // only and may be unavailable); once staged we free the snapshot and commit to the OPFS resume.
+  let ws: HoloWorkspace;
+  let opfs: { snap: SyncAccessHandle; disk: SyncAccessHandle } | null = null;
+  if (useOpfs) {
+    report({ phase: "disk", detail: "staging the warm machine in local storage" });
+    try {
+      opfs = { snap: await opfsHandle("holo-snapshot.bin"), disk: await opfsHandle("holo-disk.bin") };
+    } catch (e) {
+      console.warn("[holo-worker] OPFS sync handles unavailable, using in-heap resume:", e);
+    }
+  }
+  if (opfs) {
+    for (let off = 0; off < snapshot.length; off += 64 * 1024 * 1024) {
+      opfs.snap.write(snapshot.subarray(off, Math.min(off + 64 * 1024 * 1024, snapshot.length)), { at: off });
+    }
+    opfs.snap.flush();
+    snapshot = new Uint8Array(0); // free the 1.44 GB JS copy BEFORE the resume (it lives in OPFS now)
+    report({ phase: "resume", detail: "resuming the warm machine (disk off-heap)" });
+    ws = hs.Workspace.resume_devcontainer_net_bridged_opfs(opfs.snap, opfs.disk);
+    opfs.snap.close();
+    (await navigator.storage.getDirectory()).removeEntry("holo-snapshot.bin").catch(() => {});
+  } else {
+    report({ phase: "resume", detail: "resuming the warm machine (no cold boot)" });
+    ws = hs.Workspace.resume_devcontainer_net_bridged(snapshot);
+  }
 
   // Egress proxy: the worker can't open sockets, so it relays frames to/from the main thread.
   const egress: EgressChannel = {
@@ -101,7 +146,7 @@ ctx.onmessage = (ev: MessageEvent<ToWorker>) => {
   const msg = ev.data;
   switch (msg.t) {
     case "boot":
-      boot().catch((e) => post({ t: "booterr", message: e instanceof Error ? `${e.message}\n${e.stack ?? ""}` : String(e) }));
+      boot(msg.opfs).catch((e) => post({ t: "booterr", message: e instanceof Error ? `${e.message}\n${e.stack ?? ""}` : String(e) }));
       break;
     case "fetch": {
       if (!runtime) return post({ t: "fetcherr", rid: msg.rid, message: "runtime not ready" });
