@@ -46,12 +46,15 @@ jobs:
       - name: SPA fallback for the static server
         run: cp web/dist-pages/index.html web/dist-pages/404.html
 
-      - name: Browser e2e (real Chromium against the built artifact)
+      # Substrate + shell only: the wasm runtime loads + re-derives κ, and the shell is hermes-web
+      # (not a Hologram-OS frame, no SW). The heavy in-browser BACKEND resume (2.7 GB) is validated
+      # authoritatively by the deploy workflow's fail-closed gate — running it here too would resume
+      # the warm machine twice per push for no added coverage.
+      - name: Browser e2e — substrate + shell (real Chromium)
         run: |
           npm ci
           npx playwright install --with-deps chromium
-          if [ -f ../web/dist-pages/holo/warm/manifest.json ]; then export E2E_EXPECT_HOLOGRAM=1; fi
-          npx playwright test
+          npx playwright test deployment.spec.ts --grep-invert "resumes, authenticates"
         working-directory: e2e
 
       - name: Upload Playwright report on failure
