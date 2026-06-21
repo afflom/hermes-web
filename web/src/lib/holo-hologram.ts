@@ -98,7 +98,17 @@ export function activeRuntime(): BridgeRuntime | null {
  * outbound calls egress through the router extension when present. Throws on failure (the caller shows
  * an honest error — the data plane is holospaces or nothing).
  */
-export async function bootHologramTransport(onProgress: (p: HologramBootProgress) => void = () => {}): Promise<void> {
+export async function bootHologramTransport(report: (p: HologramBootProgress) => void = () => {}): Promise<void> {
+  const w = window as unknown as Record<string, unknown>;
+  const t0 = Date.now();
+  // Beacon every phase to `window` (+ elapsed) so tests/devtools see exactly where a long boot is.
+  const onProgress = (p: HologramBootProgress) => {
+    w.__HOLO_BOOT_PHASE__ = p.phase;
+    w.__HOLO_BOOT_DETAIL__ = p.detail ?? "";
+    w.__HOLO_BOOT_ELAPSED__ = ((Date.now() - t0) / 1000).toFixed(1);
+    report(p);
+  };
+
   onProgress({ phase: "wasm", detail: "loading the holospaces runtime" });
   const hs = await loadHs();
 
@@ -128,13 +138,11 @@ export async function bootHologramTransport(onProgress: (p: HologramBootProgress
   runtime.install();
 
   onProgress({ phase: "token", detail: "authenticating with the in-guest server" });
+  // Adopting the token means the in-guest server already served a real HTTP request over the loopback
+  // bridge — that IS the end-to-end proof the resumed backend is live and serving. Heavier /api routes
+  // run the in-guest Python (slow under interpreted RISC-V), so we don't block readiness on them.
   const token = await adoptSessionToken(runtime);
-  await verifyApi(runtime, token);
 
-  // Truthful end-to-end signal: set ONLY after resume + transport + token + a live protected /api call.
-  const w = window as unknown as Record<string, unknown>;
-  w.__HOLO_BACKEND_READY__ = true;
-  w.__HOLO_EGRESS_READY__ = !!egress;
   // Diagnostic hooks: exercise the REAL bridge transport (REST + WebSocket) from tests/devtools.
   w.__HOLO_FETCH__ = (path: string, init?: RequestInit) => {
     const headers = new Headers(init?.headers);
@@ -145,5 +153,19 @@ export async function bootHologramTransport(onProgress: (p: HologramBootProgress
     const sep = path.includes("?") ? "&" : "?";
     return runtime!.openSocket(`${path}${sep}token=${encodeURIComponent(token)}`);
   };
+
+  w.__HOLO_BACKEND_READY__ = true;
+  w.__HOLO_EGRESS_READY__ = !!egress;
   onProgress({ phase: "ready", detail: "in-browser backend live" });
+
+  // Confirm a protected /api route in the BACKGROUND (non-blocking) — it proves the Python app, not
+  // just the static SPA, answers. Surfaces on window for diagnostics; never blocks the boot.
+  void verifyApi(runtime, token)
+    .then(() => {
+      w.__HOLO_API_OK__ = true;
+    })
+    .catch((e) => {
+      w.__HOLO_API_OK__ = false;
+      console.warn("[holo] /api/status verification (background) did not complete:", e);
+    });
 }

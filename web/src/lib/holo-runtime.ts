@@ -39,9 +39,10 @@ export interface HoloWorkspace {
   egress_inbound(frame: Uint8Array): void;
 }
 
-const PUMP_BUDGET = 2_000_000; // instructions per tick (matches the CC-33 witness cadence)
-const IDLE_MS = 6; // backoff cadence when nothing is moving (keeps egress connections responsive)
-const FETCH_TIMEOUT_MS = 120_000;
+const PUMP_BUDGET = 8_000_000; // instructions per tick — larger amortizes setTimeout throttling so the
+// in-guest Python handlers (slow under interpreted RISC-V) get more cycles per macrotask.
+const IDLE_MS = 6; // backoff cadence when FULLY idle (keeps egress connections responsive)
+const FETCH_TIMEOUT_MS = 180_000;
 
 interface PendingFetch {
   connId: number;
@@ -119,7 +120,11 @@ export class BridgeRuntime {
     // 5) service loopback sockets.
     for (const s of this.sockets) if (s.service()) active = true;
 
-    this.timer = setTimeout(this.tick, active ? 0 : IDLE_MS);
+    // Pump full-speed whenever a request/socket is IN FLIGHT (the guest may be computing a response
+    // with no bytes moving yet — backing off would starve the in-guest Python handler), or there was
+    // activity this tick; only fully-idle ticks back off.
+    const busy = active || this.fetches.size > 0 || this.sockets.size > 0;
+    this.timer = setTimeout(this.tick, busy ? 0 : IDLE_MS);
   };
 
   private appended(buf: Uint8Array, chunk: Uint8Array): Uint8Array {
