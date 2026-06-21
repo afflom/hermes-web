@@ -118,13 +118,58 @@ fn the_hermes_guest_boots_and_serves_the_dashboard_api() {
     assert!(python_ok, "Python booted in the guest (HL-B); console:\n{console}");
     assert!(serving, "the in-guest dashboard server started (HL-C precondition); console:\n{console}");
 
-    // ── EXPLOIT (CC-30), BANKED FIRST: the instant the dashboard is READY, snapshot the warm machine to a
-    // content-addressed κ and PERSIST it to disk — BEFORE the emulation-expensive dial. This "banks" the
-    // one-time cold boot: even if a later step is interrupted (e.g. a sandbox SIGTERM or codespace recycle
-    // after the long interpreted boot), the warm κ survives on disk, and `the_warm_dashboard_resumes...`
-    // below restores the byte-identical warm machine from it in SECONDS with no re-boot. The browser banks
-    // exactly this to its OPFS κ-store — the substrate's designed answer to interpreted-boot cost. Uncompressed
-    // (raw `write`) so banking costs I/O, not CPU, under budget pressure; the browser gzips for OPFS.
+    // ── WARM BEFORE BANKING (the k-theoretic perf exploit): the snapshot captures RAM, so whatever
+    // first-call work the server has already done is RESUMED for free. A FastAPI/uvicorn app pays a large
+    // one-time cost on the FIRST hit to each endpoint — route resolution, Pydantic-core schema build, lazy
+    // imports, DB warm-up. Banking COLD (right at READY, zero requests served) forces the browser to re-pay
+    // all of that on first use (~70 s for `/`, minutes for `/api/status`). So we exercise every endpoint the
+    // dashboard loads HERE, then snapshot — the resumed machine serves them warm. The endpoint cold-start
+    // happens once, natively, at bank time instead of once-per-endpoint in every browser session.
+    eprintln!("[hermes-guest] warming the dashboard endpoints before banking (captures first-call cost in RAM)…");
+    let warm_t0 = std::time::Instant::now();
+    let index = warm_endpoint(&mut emu, "/", None);
+    let index_text = String::from_utf8_lossy(&index);
+    let token = index_text
+        .split("window.__HERMES_SESSION_TOKEN__=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .map(|s| s.to_owned());
+    eprintln!(
+        "[hermes-guest] warm `/` served {} bytes in {:?}; session token {}",
+        index.len(),
+        warm_t0.elapsed(),
+        if token.is_some() { "captured" } else { "NOT found (authed endpoints will only warm middleware)" }
+    );
+    // The endpoints the dashboard hits on load + the sidebar status probe + common config reads.
+    for path in [
+        "/api/status",
+        "/api/config",
+        "/api/config/schema",
+        "/api/config/defaults",
+        "/api/sessions",
+        "/api/dashboard/themes",
+        "/api/dashboard/plugins",
+        "/api/analytics/models",
+        "/api/models",
+        "/api/env",
+        "/api/cron/jobs",
+    ] {
+        let t0 = std::time::Instant::now();
+        let r = warm_endpoint(&mut emu, path, token.as_deref());
+        eprintln!("[hermes-guest]   warmed {path}: {} bytes in {:?}", r.len(), t0.elapsed());
+    }
+    // Re-hit `/` and `/api/status` now that everything is hot — proves the warm path is fast (these timings
+    // should be a fraction of the first), and ensures the steady-state working set is resident.
+    let t0 = std::time::Instant::now();
+    let _ = warm_endpoint(&mut emu, "/", None);
+    eprintln!("[hermes-guest] re-warmed `/` in {:?} (warm hit — should be « the first)", t0.elapsed());
+    let t0 = std::time::Instant::now();
+    let _ = warm_endpoint(&mut emu, "/api/status", token.as_deref());
+    eprintln!("[hermes-guest] re-warmed /api/status in {:?} (warm hit)", t0.elapsed());
+    eprintln!("[hermes-guest] warming complete in {:?} — banking the WARM machine", warm_t0.elapsed());
+
+    // Snapshot the WARM machine to a content-addressed κ and persist it. Uncompressed (raw `write`) so
+    // banking costs I/O, not CPU; the browser gzips for OPFS. This warm κ is what the browser resumes.
     let warm = emu.snapshot();
     let warm_kappa = holospaces::oci::sha256_digest(&warm);
     let warm_path = witness_dir().join("hermes-warm.kappa");
@@ -199,6 +244,111 @@ fn the_hermes_guest_boots_and_serves_the_dashboard_api() {
 // The repo's `vv/witness/` directory (four levels up from this test crate's manifest dir).
 fn witness_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../vv/witness")
+}
+
+/// Warm one endpoint before banking: dial a fresh loopback connection, issue `GET path` (optionally with
+/// the session bearer token so authed handlers actually run, not just 401 in middleware), and advance the
+/// machine until the connection closes — paying that endpoint's FIRST-CALL cost (FastAPI route resolution,
+/// Pydantic-core schema build, lazy imports, DB warm-up) so it is captured in the snapshot's RAM. The
+/// resumed browser machine then serves it warm instead of re-paying cold start. Returns the raw response.
+fn warm_endpoint(emu: &mut Emulator, path: &str, token: Option<&str>) -> Vec<u8> {
+    let mut id = None;
+    for _ in 0..400 {
+        emu.run(2_000_000);
+        if let Some(c) = emu.dial_guest(9119) {
+            id = Some(c);
+            break;
+        }
+    }
+    let Some(id) = id else {
+        eprintln!("[warm] could not dial :9119 for {path}");
+        return Vec::new();
+    };
+    let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+    let req = format!("GET {path} HTTP/1.0\r\nHost: app\r\n{auth}\r\n");
+    emu.guest_send(id, req.as_bytes());
+    let mut resp: Vec<u8> = Vec::new();
+    // Up to ~120e9 instructions of headroom; a cold first-call settles well within this and closes (HTTP/1.0).
+    for _ in 0..60_000 {
+        emu.run(2_000_000);
+        resp.extend(emu.guest_recv(id));
+        if !emu.guest_is_open(id) {
+            break;
+        }
+    }
+    emu.guest_close(id);
+    resp
+}
+
+/// OPTIMIZED RE-BANK via the substrate's own resume primitive (NOT a re-boot): restore the COLD κ — the
+/// machine the instant the server bound, zero requests served, exactly what we shipped — exercise every
+/// endpoint the dashboard loads so each one's FastAPI/uvicorn/Pydantic-core first-call cost is paid into
+/// RAM, then re-snapshot a WARM κ. This sidesteps the fragile ~24-min cold boot + OCI ingest + ext4
+/// assemble (the memory-heavy, env-killed part): resume is content-addressed and takes seconds, so the
+/// whole re-bank runs in minutes at low memory. Reads `hermes-cold.kappa`, writes `hermes-warm.kappa`.
+#[test]
+#[ignore]
+fn the_hermes_guest_resumes_warms_and_rebanks() {
+    let cold_path = witness_dir().join("hermes-cold.kappa");
+    if !cold_path.exists() {
+        eprintln!("SKIP: no cold κ at {cold_path:?} — reassemble it from the shipped CAS first");
+        return;
+    }
+    let cold = std::fs::read(&cold_path).expect("read cold κ");
+    eprintln!("[rebank] restoring COLD κ ({} bytes) — NO boot, NO ingest, NO assemble…", cold.len());
+    let t0 = std::time::Instant::now();
+    let base = MachineSpec::devcontainer_net().base;
+    let mut emu = Emulator::restore(base, &cold).expect("restore the cold Hermes κ");
+    emu.reattach_net_egress(Box::new(NoEgress)); // preserve the snapshot's negotiated virtqueues so it serves
+    assert!(emu.enable_loopback(), "loopback ingress attaches after resume");
+    eprintln!("[rebank] resumed in {:?}; settling the asyncio loop…", t0.elapsed());
+    for _ in 0..100 {
+        emu.run(2_000_000);
+    }
+
+    eprintln!("[rebank] warming the dashboard endpoints (paying first-call cost into RAM)…");
+    let warm_t0 = std::time::Instant::now();
+    let index = warm_endpoint(&mut emu, "/", None);
+    let index_text = String::from_utf8_lossy(&index);
+    let token = index_text
+        .split("window.__HERMES_SESSION_TOKEN__=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .map(|s| s.to_owned());
+    eprintln!(
+        "[rebank]   `/` served {} bytes in {:?}; session token {}",
+        index.len(),
+        warm_t0.elapsed(),
+        if token.is_some() { "captured" } else { "NOT found (authed handlers warm only middleware)" }
+    );
+    for path in [
+        "/api/status",
+        "/api/config",
+        "/api/config/schema",
+        "/api/config/defaults",
+        "/api/sessions",
+        "/api/dashboard/themes",
+        "/api/dashboard/plugins",
+        "/api/analytics/models",
+        "/api/models",
+        "/api/env",
+        "/api/cron/jobs",
+    ] {
+        let t = std::time::Instant::now();
+        let r = warm_endpoint(&mut emu, path, token.as_deref());
+        eprintln!("[rebank]   {path} → {} bytes in {:?}", r.len(), t.elapsed());
+    }
+    // A warm hit proves the win (should be « the first) and ensures the steady-state working set is resident.
+    let t = std::time::Instant::now();
+    let _ = warm_endpoint(&mut emu, "/api/status", token.as_deref());
+    eprintln!("[rebank] re-warmed /api/status in {:?} (warm hit — should be « the first)", t.elapsed());
+    eprintln!("[rebank] warming complete in {:?}; banking the WARM machine", warm_t0.elapsed());
+
+    let warm = emu.snapshot();
+    let warm_kappa = holospaces::oci::sha256_digest(&warm);
+    let warm_path = witness_dir().join("hermes-warm.kappa");
+    std::fs::write(&warm_path, &warm).expect("write the warm κ");
+    eprintln!("[rebank] ✓ WARM κ banked: {} bytes → {warm_path:?} κ={warm_kappa}", warm.len());
 }
 
 /// HL-6 (instant warm-start) — restore the warm Hermes dashboard from the κ that
