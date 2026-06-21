@@ -55,6 +55,9 @@ test.describe("Hermes agent backend (in-browser, over the loopback bridge)", () 
       expect(has, "E2E_EXPECT_HOLOGRAM=1 but no warm-κ manifest is published").toBe(true);
     }
     await page.waitForFunction("window.__HOLO_BACKEND_READY__ === true", null, { timeout: 240_000 });
+    // Warm the in-guest server with one light request so the per-test probes hit a primed backend
+    // (the very first request after resume pays cold-cache + JIT costs under emulation).
+    await api(page, "/api/config").catch(() => {});
   });
 
   test.afterAll(async () => {
