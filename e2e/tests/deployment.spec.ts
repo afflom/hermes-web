@@ -57,6 +57,10 @@ test("the in-browser holospaces backend resumes, authenticates, and renders the 
   // it. Hard-required when E2E_EXPECT_HOLOGRAM=1; otherwise skipped until the κ is shipped.
   const expectHologram = process.env.E2E_EXPECT_HOLOGRAM === "1";
   test.setTimeout(300_000); // first load fetches + resumes the 1.44 GB warm machine (~75 s)
+  // Surface the in-browser boot to the CI log — the worker relays [holo]/[hermes] boot timings + errors;
+  // if READY never arrives we can see exactly where it stalled (resume vs auth) instead of a blind timeout.
+  page.on("console", (m) => console.log(`[browser:${m.type()}] ${m.text()}`));
+  page.on("pageerror", (e) => console.log(`[browser:pageerror] ${e.message}`));
   await page.goto("./", { waitUntil: "load" });
 
   const hasManifest = await page.evaluate(async () => {
