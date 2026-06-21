@@ -44,6 +44,28 @@ async function gunzip(b: Uint8Array): Promise<Bytes> {
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
+/**
+ * Stream-decompress a gzip source DIRECTLY into a single pre-allocated buffer of known size. Unlike
+ * `gunzip` (which routes through `Response.arrayBuffer`, growing+reallocating one buffer to the full
+ * size — a transient ~2× spike that fragments the heap), this writes each decompressed chunk in place.
+ * For the 1.44 GB warm snapshot that's the difference between a ~1.45 GB peak and a ~2.9 GB spike — the
+ * latter OOM-crashes the tab on refresh, on top of the resume itself.
+ */
+async function gunzipInto(gz: Uint8Array, size: number): Promise<Bytes> {
+  const out = new Uint8Array(size);
+  const reader = new Response(gz as BodyInit).body!.pipeThrough(new DecompressionStream("gzip")).getReader();
+  let offset = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (offset + value.length > size) throw new Error("cached snapshot exceeds expected size");
+    out.set(value, offset);
+    offset += value.length;
+  }
+  if (offset !== size) throw new Error(`cached snapshot size mismatch (${offset} ≠ ${size})`);
+  return out as Bytes;
+}
+
 async function gzip(b: Uint8Array): Promise<Bytes> {
   const stream = new Response(b as BodyInit).body!.pipeThrough(new CompressionStream("gzip"));
   return new Uint8Array(await new Response(stream).arrayBuffer());
@@ -65,20 +87,21 @@ async function opfsDir(): Promise<FileSystemDirectoryHandle | null> {
 }
 
 /** Read a previously-persisted snapshot from OPFS and verify it by re-derivation; null on miss/corruption. */
-async function readCached(kappa: string, k: KappaFn, onProgress: OnProgress): Promise<Bytes | null> {
+async function readCached(manifest: WarmManifest, k: KappaFn, onProgress: OnProgress): Promise<Bytes | null> {
   const dir = await opfsDir();
   if (!dir) return null;
   try {
     onProgress({ phase: "cache", detail: "checking local snapshot store" });
-    const fh = await dir.getFileHandle(cacheKey(kappa));
+    const fh = await dir.getFileHandle(cacheKey(manifest.kappa));
     const gz = new Uint8Array(await (await fh.getFile()).arrayBuffer());
-    const snapshot = await gunzip(gz);
+    // Stream-decompress into a pre-allocated buffer (no Response.arrayBuffer 2× spike — see gunzipInto).
+    const snapshot = await gunzipInto(gz, manifest.size);
     // ADR-019: OPFS is durable but untrusted — accept only if it re-derives to the recorded κ.
-    if (k(snapshot) === kappa) {
+    if (k(snapshot) === manifest.kappa) {
       onProgress({ phase: "cache", fraction: 1, detail: "restored from local snapshot store" });
       return snapshot;
     }
-    await dir.removeEntry(cacheKey(kappa)).catch(() => {}); // corrupt — drop so the fetch path repopulates
+    await dir.removeEntry(cacheKey(manifest.kappa)).catch(() => {}); // corrupt — drop so the fetch path repopulates
     return null;
   } catch {
     return null;
@@ -121,7 +144,7 @@ export async function loadWarmSnapshot(kappa: KappaFn, onProgress: OnProgress = 
   }
 
   // Fast path: the exact snapshot already sits in OPFS, verified by re-derivation.
-  const cached = await readCached(manifest.kappa, kappa, onProgress);
+  const cached = await readCached(manifest, kappa, onProgress);
   if (cached) return cached;
 
   // Fetch each chunk and concatenate into the full snapshot (pure transport framing).

@@ -13,6 +13,7 @@ function mockWs(): HoloWorkspace & { egressQueue: Uint8Array[]; inboundGot: Uint
     inboundGot: [] as Uint8Array[],
     lastRequest: undefined as string | undefined,
     run: () => false,
+    terminal_delta: () => "",
     dial_guest: () => {
       const id = nextId++;
       open.set(id, true);

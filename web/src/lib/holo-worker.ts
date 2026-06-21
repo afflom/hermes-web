@@ -26,8 +26,13 @@ interface HsModule {
   kappa: (bytes: Uint8Array) => string;
   Workspace: {
     resume_devcontainer_net_bridged: (snapshot: Uint8Array) => HoloWorkspace;
-    resume_devcontainer_net_bridged_opfs: (snapshot: SyncAccessHandle, disk: SyncAccessHandle) => HoloWorkspace;
+    resume_devcontainer_net_bridged_streamed: (snapshot: SyncAccessHandle) => HoloWorkspace;
   };
+}
+
+/** Surface a diagnostic line to the main thread (→ browser console). */
+function log(level: "info" | "warn" | "error" | "guest", msg: string) {
+  post({ t: "log", level, msg });
 }
 
 /** Create a truncated OPFS sync access handle (worker-only) for `name`. */
@@ -57,47 +62,53 @@ let runtime: BridgeRuntime | null = null;
 let egressInbound: ((f: Uint8Array) => void) | null = null;
 const sockets = new Map<number, RuntimeSocket>();
 
-async function boot(useOpfs: boolean): Promise<void> {
+async function boot(_useOpfs: boolean): Promise<void> {
   const report = (p: HologramBootProgress) => post({ t: "progress", p });
+  const t0 = performance.now();
+  const since = (mark: number) => `${((performance.now() - mark) / 1000).toFixed(1)}s`;
 
   report({ phase: "wasm", detail: "loading the holospaces runtime" });
   const hs = (await import(/* @vite-ignore */ holoUrl("holospaces_web.js"))) as HsModule;
   await hs.default();
+  log("info", `wasm runtime loaded (${since(t0)})`);
 
   report({ phase: "snapshot", detail: "fetching the warm Hermes machine" });
+  const tSnap = performance.now();
   let snapshot = await loadWarmSnapshot(
     (b) => hs.kappa(b),
     (p: WarmLoadProgress) =>
       report({ phase: p.phase === "verify" || p.phase === "persist" ? "resume" : "snapshot", detail: p.detail, fraction: p.fraction }),
   );
+  log("info", `warm machine loaded + verified, ${(snapshot.length / 1e6).toFixed(0)} MB (${since(tSnap)})`);
 
-  // OPFS-κ-store path: stage the snapshot in OPFS, FREE the JS copy, then resume with the disk paged
-  // into an OPFS store — so the multi-hundred-MB disk never lands on the wasm heap (mobile-capable,
-  // ~700 MB resident vs ~2.7 GB). Only the OPFS *setup* is fallible (sync access handles are worker-
-  // only and may be unavailable); once staged we free the snapshot and commit to the OPFS resume.
+  // DEFAULT resume = STREAMED into an in-wasm MemKappaStore: stage the snapshot in OPFS, FREE the JS
+  // copy, then resume by streaming it back — so the wasm heap never holds the 1.44 GB snapshot copy
+  // (the ~2.7 GB monolithic peak that aborts on refresh). The disk stays in-wasm, so serving is full
+  // speed. Falls back to the monolithic in-heap resume only if OPFS sync handles are unavailable.
   let ws: HoloWorkspace;
-  let opfs: { snap: SyncAccessHandle; disk: SyncAccessHandle } | null = null;
-  if (useOpfs) {
-    report({ phase: "disk", detail: "staging the warm machine in local storage" });
-    try {
-      opfs = { snap: await opfsHandle("holo-snapshot.bin"), disk: await opfsHandle("holo-disk.bin") };
-    } catch (e) {
-      console.warn("[holo-worker] OPFS sync handles unavailable, using in-heap resume:", e);
-    }
+  let snap: SyncAccessHandle | null = null;
+  try {
+    snap = await opfsHandle("holo-snapshot.bin");
+  } catch (e) {
+    log("warn", `OPFS sync handles unavailable — falling back to in-heap resume: ${e}`);
   }
-  if (opfs) {
+  const tResume = performance.now();
+  if (snap) {
+    report({ phase: "disk", detail: "staging the warm machine in local storage" });
     for (let off = 0; off < snapshot.length; off += 64 * 1024 * 1024) {
-      opfs.snap.write(snapshot.subarray(off, Math.min(off + 64 * 1024 * 1024, snapshot.length)), { at: off });
+      snap.write(snapshot.subarray(off, Math.min(off + 64 * 1024 * 1024, snapshot.length)), { at: off });
     }
-    opfs.snap.flush();
+    snap.flush();
     snapshot = new Uint8Array(0); // free the 1.44 GB JS copy BEFORE the resume (it lives in OPFS now)
-    report({ phase: "resume", detail: "resuming the warm machine (disk off-heap)" });
-    ws = hs.Workspace.resume_devcontainer_net_bridged_opfs(opfs.snap, opfs.disk);
-    opfs.snap.close();
+    report({ phase: "resume", detail: "resuming the warm machine (low-memory streamed)" });
+    ws = hs.Workspace.resume_devcontainer_net_bridged_streamed(snap);
+    snap.close();
     (await navigator.storage.getDirectory()).removeEntry("holo-snapshot.bin").catch(() => {});
+    log("info", `resumed (streamed, low-peak) in ${since(tResume)}`);
   } else {
     report({ phase: "resume", detail: "resuming the warm machine (no cold boot)" });
     ws = hs.Workspace.resume_devcontainer_net_bridged(snapshot);
+    log("info", `resumed (monolithic in-heap) in ${since(tResume)}`);
   }
 
   // Egress proxy: the worker can't open sockets, so it relays frames to/from the main thread.
@@ -110,16 +121,33 @@ async function boot(useOpfs: boolean): Promise<void> {
   report({ phase: "attach", detail: "re-attaching the loopback transport" });
   runtime = new BridgeRuntime(ws, { port: GUEST_PORT, egress });
   runtime.start();
+  startConsoleRelay(runtime); // surface the in-guest server/agent logs to the browser console
 
   report({ phase: "token", detail: "authenticating with the in-guest server" });
   const token = await adoptToken(runtime);
+  log("info", `in-guest server authenticated; ready in ${since(t0)} total`);
   post({ t: "ready", token: token.token, embedded: token.embedded, authRequired: token.authRequired });
 
   // Background: confirm a protected /api route answers (the in-guest Python, not just the static SPA).
   runtime
     .fetch("/api/status", { headers: { authorization: `Bearer ${token.token}` } })
-    .then((r) => post({ t: "apiok", ok: r.ok }))
-    .catch(() => post({ t: "apiok", ok: false }));
+    .then((r) => { log(r.ok ? "info" : "warn", `/api/status → ${r.status}`); post({ t: "apiok", ok: r.ok }); })
+    .catch((e) => { log("error", `/api/status failed: ${e}`); post({ t: "apiok", ok: false }); });
+}
+
+/** Poll the guest console and relay new output to the main thread (→ browser console). */
+function startConsoleRelay(rt: BridgeRuntime): void {
+  let carry = "";
+  setInterval(() => {
+    const delta = rt.consoleDelta();
+    if (!delta) return;
+    carry += delta;
+    const nl = carry.lastIndexOf("\n");
+    if (nl < 0) return;
+    const out = carry.slice(0, nl);
+    carry = carry.slice(nl + 1);
+    if (out.trim()) log("guest", out);
+  }, 1000);
 }
 
 async function adoptToken(rt: BridgeRuntime): Promise<{ token: string; embedded: boolean; authRequired: boolean }> {

@@ -1,8 +1,90 @@
+diff --git a/crates/holospaces-emulator/Cargo.lock b/crates/holospaces-emulator/Cargo.lock
+index 8ca6d25..038ba0f 100644
+--- a/crates/holospaces-emulator/Cargo.lock
++++ b/crates/holospaces-emulator/Cargo.lock
+@@ -2,6 +2,12 @@
+ # It is not intended for manual editing.
+ version = 4
+ 
++[[package]]
++name = "adler2"
++version = "2.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
++
+ [[package]]
+ name = "allocator-api2"
+ version = "0.2.21"
+@@ -173,6 +179,18 @@ dependencies = [
+  "uor-prism",
+ ]
+ 
++[[package]]
++name = "hologram-net-bare"
++version = "0.6.0"
++source = "git+https://github.com/Hologram-Technologies/hologram?rev=18f553d8578997ce32e7b653786a0bcf9b09a2c0#18f553d8578997ce32e7b653786a0bcf9b09a2c0"
++dependencies = [
++ "async-trait",
++ "hashbrown",
++ "hologram-bare-hal",
++ "hologram-substrate-core",
++ "spin",
++]
++
+ [[package]]
+ name = "hologram-realizations"
+ version = "0.6.0"
+@@ -181,6 +199,16 @@ dependencies = [
+  "hologram-substrate-core",
+ ]
+ 
++[[package]]
++name = "hologram-store-mem"
++version = "0.6.0"
++source = "git+https://github.com/Hologram-Technologies/hologram?rev=18f553d8578997ce32e7b653786a0bcf9b09a2c0#18f553d8578997ce32e7b653786a0bcf9b09a2c0"
++dependencies = [
++ "hashbrown",
++ "hologram-substrate-core",
++ "spin",
++]
++
+ [[package]]
+ name = "hologram-substrate-core"
+ version = "0.6.0"
+@@ -198,9 +226,12 @@ version = "0.0.0"
+ dependencies = [
+  "async-trait",
+  "hologram-bare-hal",
++ "hologram-net-bare",
+  "hologram-realizations",
++ "hologram-store-mem",
+  "hologram-substrate-core",
+  "libm",
++ "miniz_oxide",
+  "spin",
+ ]
+ 
+@@ -233,6 +264,15 @@ version = "0.2.16"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+ 
++[[package]]
++name = "miniz_oxide"
++version = "0.8.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
++dependencies = [
++ "adler2",
++]
++
+ [[package]]
+ name = "proc-macro2"
+ version = "1.0.106"
 diff --git a/crates/holospaces-web/src/lib.rs b/crates/holospaces-web/src/lib.rs
-index bed80bd..7b58881 100644
+index bed80bd..9a87ded 100644
 --- a/crates/holospaces-web/src/lib.rs
 +++ b/crates/holospaces-web/src/lib.rs
-@@ -47,7 +47,64 @@ use holospaces::assembly::{assemble_ext4, assemble_ext4_bootable, Layer};
+@@ -47,7 +47,88 @@ use holospaces::assembly::{assemble_ext4, assemble_ext4_bootable, Layer};
  use holospaces::boot::{devcontainer, provision, LifecycleError, ReadVerify, Resolver, Session};
  use holospaces::config::{Configuration, Directive, LifecycleAction};
  use holospaces::content_net::ContentPeer;
@@ -11,64 +93,88 @@ index bed80bd..7b58881 100644
 +
 +/// A [`StreamRead`] over an OPFS file (the reassembled κ-snapshot the worker wrote). Reads sequentially
 +/// via the sync access handle so `restore_net_streamed` never holds the whole 1.44 GB in the wasm heap.
++///
++/// BLOCK-BUFFERED: the streamed restore reads the disk one 512-byte sector at a time (~1.7 M reads for
++/// the 900 MB disk). Issuing a separate OPFS syscall per sector makes resume crawl; instead we pull the
++/// file in `READ_BLOCK` chunks and serve `read_exact` from that buffer, cutting OPFS reads ~8000×.
 +struct OpfsReader {
 +    handle: web_sys::FileSystemSyncAccessHandle,
-+    pos: f64,
++    pos: f64,  // logical bytes consumed from the file
 +    size: f64,
++    buf: Vec<u8>,   // a contiguous window of the file starting at `buf_base`
++    buf_base: f64,  // file offset of buf[0]
 +}
++const READ_BLOCK: usize = 4 * 1024 * 1024; // 4 MiB OPFS reads amortize per-sector restore reads
 +impl OpfsReader {
 +    fn new(handle: web_sys::FileSystemSyncAccessHandle) -> Result<Self, JsValue> {
 +        let size = handle.get_size()?;
-+        Ok(OpfsReader { handle, pos: 0.0, size })
++        Ok(OpfsReader { handle, pos: 0.0, size, buf: Vec::new(), buf_base: 0.0 })
 +    }
-+}
-+impl StreamRead for OpfsReader {
-+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), SnapshotError> {
-+        if self.pos + buf.len() as f64 > self.size {
-+            return Err(SnapshotError::Truncated);
-+        }
-+        // The sync access handle can return a short read; loop until `buf` is full.
++    /// Read exactly `out.len()` bytes from OPFS at `at`, looping over short reads.
++    fn read_at(&self, at: f64, out: &mut [u8]) -> Result<(), SnapshotError> {
 +        let mut filled = 0usize;
-+        while filled < buf.len() {
++        while filled < out.len() {
 +            let opts = web_sys::FileSystemReadWriteOptions::new();
-+            opts.set_at(self.pos + filled as f64);
++            opts.set_at(at + filled as f64);
 +            let n = self
 +                .handle
-+                .read_with_u8_array_and_options(&mut buf[filled..], &opts)
++                .read_with_u8_array_and_options(&mut out[filled..], &opts)
 +                .map_err(|_| SnapshotError::Truncated)? as usize;
 +            if n == 0 {
 +                return Err(SnapshotError::Truncated);
 +            }
 +            filled += n;
 +        }
-+        self.pos += buf.len() as f64;
++        Ok(())
++    }
++}
++impl StreamRead for OpfsReader {
++    fn read_exact(&mut self, out: &mut [u8]) -> Result<(), SnapshotError> {
++        if self.pos + out.len() as f64 > self.size {
++            return Err(SnapshotError::Truncated);
++        }
++        let mut filled = 0usize;
++        while filled < out.len() {
++            let off = (self.pos - self.buf_base) as i64;
++            if off < 0 || off as usize >= self.buf.len() {
++                // Refill the window at the current position (bounded by EOF).
++                let want = ((self.size - self.pos) as usize).min(READ_BLOCK);
++                let mut tmp = vec![0u8; want];
++                self.read_at(self.pos, &mut tmp)?;
++                self.buf = tmp;
++                self.buf_base = self.pos;
++            }
++            let off = (self.pos - self.buf_base) as usize;
++            let n = (self.buf.len() - off).min(out.len() - filled);
++            out[filled..filled + n].copy_from_slice(&self.buf[off..off + n]);
++            filled += n;
++            self.pos += n as f64;
++        }
 +        Ok(())
 +    }
 +    fn read_to_end(&mut self) -> Result<Vec<u8>, SnapshotError> {
 +        let remaining = (self.size - self.pos) as usize;
-+        let mut v = vec![0u8; remaining];
-+        let mut filled = 0usize;
-+        while filled < remaining {
-+            let opts = web_sys::FileSystemReadWriteOptions::new();
-+            opts.set_at(self.pos + filled as f64);
-+            let n = self
-+                .handle
-+                .read_with_u8_array_and_options(&mut v[filled..], &opts)
-+                .map_err(|_| SnapshotError::Truncated)? as usize;
-+            if n == 0 {
-+                break;
-+            }
-+            filled += n;
++        let mut v = Vec::with_capacity(remaining);
++        // Drain any bytes already in the window, then read the rest straight through.
++        let off = (self.pos - self.buf_base) as i64;
++        if off >= 0 && (off as usize) < self.buf.len() {
++            v.extend_from_slice(&self.buf[off as usize..]);
++            self.pos += (self.buf.len() - off as usize) as f64;
 +        }
-+        v.truncate(filled);
-+        self.pos = self.size;
++        let rest = (self.size - self.pos) as usize;
++        if rest > 0 {
++            let start = v.len();
++            v.resize(start + rest, 0);
++            self.read_at(self.pos, &mut v[start..])?;
++            self.pos = self.size;
++        }
 +        Ok(v)
 +    }
 +}
  use holospaces::identity::{Operator, Roster};
  use holospaces::machine::MachineSpec;
  use holospaces::oci::ImagePull;
-@@ -1342,6 +1399,45 @@ impl Workspace {
+@@ -1342,6 +1423,45 @@ impl Workspace {
          })
      }
  
@@ -114,7 +220,7 @@ index bed80bd..7b58881 100644
      /// Drain the next egress frame the guest produced, for the page to carry to
      /// the router. `undefined` when none is queued (or this is not a routed boot).
      #[must_use]
-@@ -1389,6 +1485,90 @@ impl Workspace {
+@@ -1389,6 +1509,118 @@ impl Workspace {
          })
      }
  
@@ -187,6 +293,34 @@ index bed80bd..7b58881 100644
 +        let base = MachineSpec::devcontainer().base;
 +        let mut reader = OpfsReader::new(snapshot_handle)?;
 +        let disk_store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
++        let mut machine = Emulator::restore_net_streamed(base, &mut reader, disk_store).map_err(js_err)?;
++        let (egress, router) = net::ChannelEgress::new();
++        machine.reattach_net_egress(Box::new(egress));
++        machine.enable_loopback();
++        Ok(Workspace {
++            machine,
++            store: MemKappaStore::new(),
++            channel: Vec::new(),
++            files: std::collections::BTreeMap::new(),
++            halted: false,
++            console_cursor: 0,
++            router: Some(router),
++        })
++    }
++
++    /// Resume by **streaming the κ-snapshot from an OPFS file** (so the wasm heap never holds the 1.44 GB
++    /// copy the monolithic `&[u8]` resume needs — that copy + the parsed RAM/disk is the ~2.7 GB peak that
++    /// trips the wasm32 ceiling and aborts on a refresh) — but page the guest disk into an **in-wasm
++    /// `MemKappaStore`**, exactly like the monolithic resume, so per-request serving stays full speed (no
++    /// OPFS round-trip on the hot path). This is the production default: lower resume peak (~1.4 GB,
++    /// crash-free) AND fast serving. The worker writes the verified snapshot to `snapshot_handle`; egress
++    /// + loopback are re-attached exactly as the monolithic path.
++    pub fn resume_devcontainer_net_bridged_streamed(
++        snapshot_handle: web_sys::FileSystemSyncAccessHandle,
++    ) -> Result<Workspace, JsValue> {
++        let base = MachineSpec::devcontainer().base;
++        let mut reader = OpfsReader::new(snapshot_handle)?;
++        let disk_store = Box::new(MemKappaStore::new());
 +        let mut machine = Emulator::restore_net_streamed(base, &mut reader, disk_store).map_err(js_err)?;
 +        let (egress, router) = net::ChannelEgress::new();
 +        machine.reattach_net_egress(Box::new(egress));

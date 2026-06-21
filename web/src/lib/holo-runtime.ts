@@ -30,6 +30,7 @@ import type { EgressChannel } from "./holo-egress";
 /** The holospaces-web `Workspace` surface the runtime drives (snake_case wasm-bindgen exports). */
 export interface HoloWorkspace {
   run(budget: number): boolean;
+  terminal_delta(): string; // guest console bytes since the last call (the in-guest server/agent logs)
   dial_guest(port: number): number | undefined;
   guest_send(id: number, data: Uint8Array): void;
   guest_recv(id: number): Uint8Array;
@@ -39,8 +40,8 @@ export interface HoloWorkspace {
   egress_inbound(frame: Uint8Array): void;
 }
 
-const PUMP_BUDGET = 8_000_000; // instructions per tick — larger amortizes setTimeout throttling so the
-// in-guest Python handlers (slow under interpreted RISC-V) get more cycles per macrotask.
+const PUMP_BUDGET = 8_000_000; // instructions per tick — a chunk small enough to stay responsive to new
+// fetches/egress between bursts, large enough that per-tick JS overhead is negligible.
 const IDLE_MS = 6; // backoff cadence when FULLY idle (keeps egress connections responsive)
 const FETCH_TIMEOUT_MS = 180_000;
 
@@ -63,6 +64,13 @@ export class BridgeRuntime {
   private fetches = new Set<PendingFetch>();
   private sockets = new Set<RuntimeSocket>();
   private inbound: Uint8Array[] = []; // egress frames from the extension, applied at the next tick
+  // Unclamped reschedule: `setTimeout(0)` is clamped to ~4 ms after a few nested levels (even in a
+  // worker), which idles the RISC-V interpreter between bursts and throttles the in-guest server. A
+  // MessagePort message reschedules the next tick with NO clamp, so when there's work in flight the
+  // emulator runs at ~100% duty cycle while still yielding to drain the worker's message queue.
+  private chan: MessageChannel | null = typeof MessageChannel !== "undefined" ? new MessageChannel() : null;
+  private tickCount = 0;
+  private runMs = 0;
 
   constructor(ws: HoloWorkspace, opts: { port?: number; egress?: EgressChannel | null } = {}) {
     this.ws = ws;
@@ -70,6 +78,7 @@ export class BridgeRuntime {
     this.egress = opts.egress ?? null;
     // Replies from the extension's sockets — queued, applied on-tick (single owner of the machine).
     this.egress?.onFrame((f) => this.inbound.push(f));
+    if (this.chan) this.chan.port1.onmessage = () => this.tick();
   }
 
   start(): void {
@@ -82,6 +91,20 @@ export class BridgeRuntime {
     this.running = false;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
+  }
+
+  /** Guest console output since the last call — the in-guest server/agent's own logs, for surfacing. */
+  consoleDelta(): string {
+    try {
+      return this.ws.terminal_delta();
+    } catch {
+      return "";
+    }
+  }
+
+  /** Snapshot of pump/serving counters for diagnostics. */
+  metrics(): { ticks: number; runMs: number; fetchesInFlight: number; socketsOpen: number } {
+    return { ticks: this.tickCount, runMs: Math.round(this.runMs), fetchesInFlight: this.fetches.size, socketsOpen: this.sockets.size };
   }
 
   /** Install this runtime as the dashboard's transport (api.ts seam). Returns an uninstall fn. */
@@ -104,7 +127,10 @@ export class BridgeRuntime {
     }
 
     // 2) advance the machine.
+    const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
     this.ws.run(PUMP_BUDGET);
+    this.runMs += (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
+    this.tickCount++;
 
     // 3) egress OUT: hand the guest's outbound frames to the extension.
     if (this.egress) {
@@ -124,7 +150,11 @@ export class BridgeRuntime {
     // with no bytes moving yet — backing off would starve the in-guest Python handler), or there was
     // activity this tick; only fully-idle ticks back off.
     const busy = active || this.fetches.size > 0 || this.sockets.size > 0;
-    this.timer = setTimeout(this.tick, busy ? 0 : IDLE_MS);
+    if (busy && this.chan) {
+      this.chan.port2.postMessage(0); // unclamped immediate reschedule — keep the interpreter hot
+    } else {
+      this.timer = setTimeout(this.tick, busy ? 0 : IDLE_MS);
+    }
   };
 
   private appended(buf: Uint8Array, chunk: Uint8Array): Uint8Array {

@@ -1803,6 +1803,24 @@ export class Workspace {
         return Workspace.__wrap(ret[0]);
     }
     /**
+     * Resume by **streaming the κ-snapshot from an OPFS file** (so the wasm heap never holds the 1.44 GB
+     * copy the monolithic `&[u8]` resume needs — that copy + the parsed RAM/disk is the ~2.7 GB peak that
+     * trips the wasm32 ceiling and aborts on a refresh) — but page the guest disk into an **in-wasm
+     * `MemKappaStore`**, exactly like the monolithic resume, so per-request serving stays full speed (no
+     * OPFS round-trip on the hot path). This is the production default: lower resume peak (~1.4 GB,
+     * crash-free) AND fast serving. The worker writes the verified snapshot to `snapshot_handle`; egress
+     * + loopback are re-attached exactly as the monolithic path.
+     * @param {FileSystemSyncAccessHandle} snapshot_handle
+     * @returns {Workspace}
+     */
+    static resume_devcontainer_net_bridged_streamed(snapshot_handle) {
+        const ret = wasm.workspace_resume_devcontainer_net_bridged_streamed(snapshot_handle);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return Workspace.__wrap(ret[0]);
+    }
+    /**
      * Advance the running holospace by `budget` instructions (one chunk of the
      * boot or of servicing input). Returns `true` once the machine has halted
      * (powered off). Call repeatedly from a UI loop, rendering

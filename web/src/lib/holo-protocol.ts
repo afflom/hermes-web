@@ -30,4 +30,5 @@ export type FromWorker =
   | { t: "wsclosed"; sid: number; code: number; reason: string }
   | { t: "wserr"; sid: number; message: string }
   | { t: "egressout"; frame: Uint8Array } // a guest frame to carry to the extension
-  | { t: "apiok"; ok: boolean }; // background /api/status verification result
+  | { t: "apiok"; ok: boolean } // background /api/status verification result
+  | { t: "log"; level: "info" | "warn" | "error" | "guest"; msg: string }; // surfaced diagnostics
