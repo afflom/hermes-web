@@ -22,12 +22,8 @@ interface HsModule {
   };
 }
 
-export interface HologramBootProgress {
-  phase: "wasm" | "snapshot" | "disk" | "resume" | "attach" | "egress" | "token" | "ready" | "error";
-  detail?: string;
-  /** 0..1 within a phase that reports sub-progress (the snapshot fetch). */
-  fraction?: number;
-}
+import type { HologramBootProgress } from "./holo-hologram-types";
+export type { HologramBootProgress };
 
 const GUEST_PORT = 9119;
 const TOKEN_RE = /window\.__HERMES_SESSION_TOKEN__\s*=\s*"([^"]+)"/;

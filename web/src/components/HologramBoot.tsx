@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { bootHologramTransport, type HologramBootProgress } from "../lib/holo-hologram";
+import { bootWorkerTransport } from "../lib/holo-client";
+import type { HologramBootProgress } from "../lib/holo-hologram-types";
 import { HoloEgressPrompt } from "./HoloEgressPrompt";
 
 // HologramBoot — the gate in front of the dashboard on the Pages build. The data plane is the real
@@ -27,7 +28,7 @@ export function HologramBoot({ children }: { children: ReactNode }) {
   const [progress, setProgress] = useState<HologramBootProgress>({ phase: "wasm" });
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
-  const started = useRef(0);
+  const started = useRef(-1); // sentinel: nothing started yet (attempt 0 must still run)
 
   useEffect(() => {
     if (started.current === attempt) return; // boot once per attempt (StrictMode-safe)
@@ -35,10 +36,12 @@ export function HologramBoot({ children }: { children: ReactNode }) {
     setError(null);
     (async () => {
       try {
-        await bootHologramTransport(setProgress);
+        await bootWorkerTransport(setProgress);
         setReady(true);
       } catch (err) {
         console.error("[holo] in-browser backend failed to start:", err);
+        (window as unknown as Record<string, unknown>).__HOLO_BOOT_ERROR__ =
+          err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err);
         setError(err instanceof Error ? err.message : String(err));
       }
     })();
