@@ -53,6 +53,38 @@ export function awaitEgressExtensionId(timeoutMs = 1500): Promise<string | null>
   });
 }
 
+// The router-extension version THIS build of hermes-web requires (the version it bundles under
+// public/holo/extension). An installed extension older than this — or one too old to announce a version
+// at all — is treated as incompatible and the operator is prompted to reinstall the bundled build.
+export const REQUIRED_EXTENSION_VERSION = "0.1.0";
+
+/** The installed extension's announced version (`data-holospaces-egress-version`), or null. */
+export function detectEgressExtensionVersion(): string | null {
+  if (typeof document === "undefined") return null;
+  const v = document.documentElement.getAttribute("data-holospaces-egress-version");
+  return v && v.length > 0 ? v : null;
+}
+
+/** Dotted-version compare: true iff `have` >= `need` (e.g. "0.1.0" >= "0.1.0"). */
+export function versionAtLeast(have: string, need: string): boolean {
+  const h = have.split(".").map((n) => parseInt(n, 10) || 0);
+  const n = need.split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(h.length, n.length); i++) {
+    const a = h[i] ?? 0;
+    const b = n[i] ?? 0;
+    if (a !== b) return a > b;
+  }
+  return true;
+}
+
+/** Compatibility state of the router extension on this page: absent, installed-but-outdated, or ok. */
+export function egressExtensionStatus(): "absent" | "outdated" | "ok" {
+  if (detectEgressExtensionId() == null) return "absent";
+  const v = detectEgressExtensionVersion();
+  if (v == null || !versionAtLeast(v, REQUIRED_EXTENSION_VERSION)) return "outdated";
+  return "ok";
+}
+
 /** Whether this browser could talk to an installed extension at all (Chromium with `chrome.runtime`). */
 export function egressRuntimeAvailable(): boolean {
   const c = (globalThis as { chrome?: { runtime?: { connect?: unknown } } }).chrome;

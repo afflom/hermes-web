@@ -349,6 +349,24 @@ fn the_hermes_guest_resumes_warms_and_rebanks() {
     let warm_path = witness_dir().join("hermes-warm.kappa");
     std::fs::write(&warm_path, &warm).expect("write the warm κ");
     eprintln!("[rebank] ✓ WARM κ banked: {} bytes → {warm_path:?} κ={warm_kappa}", warm.len());
+
+    // CRITICAL: verify the WARM κ actually RESUMES AND SERVES (the browser will). The cold κ does; the
+    // warm one must too, or warming left the net/loopback device in a state that doesn't survive
+    // restore. Drop the live machine, restore from the just-banked warm κ exactly as the browser does
+    // (restore → reattach egress → enable loopback), and dial the in-guest server.
+    drop(emu);
+    eprintln!("[rebank] verifying the WARM κ resumes AND serves (as the browser will)…");
+    let mut resumed = Emulator::restore(base, &warm).expect("resume the warm κ");
+    resumed.reattach_net_egress(Box::new(NoEgress));
+    assert!(resumed.enable_loopback(), "loopback attaches on warm-κ resume");
+    let probe = warm_endpoint(&mut resumed, "/api/status", None);
+    let ok = String::from_utf8_lossy(&probe).contains("HTTP/1.");
+    eprintln!(
+        "[rebank] warm-κ resume serve check: /api/status → {} bytes, serves={ok}",
+        probe.len()
+    );
+    assert!(ok, "the WARM κ must resume AND serve over loopback — warming must not break serve-after-resume");
+    eprintln!("[rebank] ✓ warm κ resumes AND serves — safe to ship");
 }
 
 /// HL-6 (instant warm-start) — restore the warm Hermes dashboard from the κ that

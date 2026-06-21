@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "holospaces router",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "The holospaces router: carries a browser-tab guest's traffic to the internet via Direct Sockets (raw TCP). No node, no proxy.",
 
   "background": { "service_worker": "background.js" },
