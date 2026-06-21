@@ -56,6 +56,7 @@ test("the in-browser holospaces backend resumes, authenticates, and renders the 
   // (its injected token reaches window.__HERMES_SESSION_TOKEN__), and the real dashboard renders against
   // it. Hard-required when E2E_EXPECT_HOLOGRAM=1; otherwise skipped until the κ is shipped.
   const expectHologram = process.env.E2E_EXPECT_HOLOGRAM === "1";
+  test.setTimeout(300_000); // first load fetches + resumes the 1.44 GB warm machine (~75 s)
   await page.goto("./", { waitUntil: "load" });
 
   const hasManifest = await page.evaluate(async () => {
