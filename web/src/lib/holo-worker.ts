@@ -28,6 +28,37 @@ function log(level: "info" | "warn" | "error" | "guest", msg: string) {
   post({ t: "log", level, msg });
 }
 
+// ── Bridge response cache (k-theoretic memoization at the seam) ──────────────────────────────────────
+// The in-guest server is multi-second per request under interpretation, and the dashboard re-fetches the
+// same idempotent GETs constantly (sidebar status polling, re-renders, navigating back to a view). Collapse
+// those: an in-flight GET is shared by all concurrent callers (dedup), and a completed GET is reused for a
+// short TTL — so a poll storm runs the guest ONCE, not N times. Any mutating request clears the cache so
+// reads-after-writes stay correct; the short TTL bounds staleness for everything else.
+const CACHE_TTL_MS = 3000;
+interface CachedRes { status: number; statusText: string; headers: [string, string][]; body: ArrayBuffer }
+const fetchCache = new Map<string, { res: Promise<CachedRes>; done: boolean; at: number }>();
+
+function runGuestFetch(msg: { path: string; method: string; headers: Record<string, string>; body?: string }): Promise<CachedRes> {
+  return runtime!
+    .fetch(msg.path, { method: msg.method, headers: msg.headers, body: msg.body })
+    .then(async (res) => ({ status: res.status, statusText: res.statusText, headers: [...res.headers.entries()] as [string, string][], body: await res.arrayBuffer() }));
+}
+
+function serveGuestFetch(msg: { path: string; method: string; headers: Record<string, string>; body?: string }): Promise<CachedRes> {
+  const isGet = (msg.method || "GET").toUpperCase() === "GET";
+  if (!isGet) {
+    fetchCache.clear(); // a mutation can change any read
+    return runGuestFetch(msg);
+  }
+  const key = msg.path;
+  const hit = fetchCache.get(key);
+  if (hit && (!hit.done || Date.now() - hit.at < CACHE_TTL_MS)) return hit.res;
+  const entry = { res: runGuestFetch(msg), done: false, at: Date.now() };
+  fetchCache.set(key, entry);
+  entry.res.then(() => { entry.done = true; entry.at = Date.now(); }, () => fetchCache.delete(key));
+  return entry.res;
+}
+
 const GUEST_PORT = 9119;
 const TOKEN_RE = /window\.__HERMES_SESSION_TOKEN__\s*=\s*"([^"]+)"/;
 const EMBEDDED_RE = /window\.__HERMES_DASHBOARD_EMBEDDED_CHAT__\s*=\s*(true|false)/;
@@ -159,14 +190,13 @@ ctx.onmessage = (ev: MessageEvent<ToWorker>) => {
       break;
     case "fetch": {
       if (!runtime) return post({ t: "fetcherr", rid: msg.rid, message: "runtime not ready" });
-      runtime
-        .fetch(msg.path, { method: msg.method, headers: msg.headers, body: msg.body })
-        .then(async (res) => {
-          const body = await res.arrayBuffer();
-          post(
-            { t: "fetchres", rid: msg.rid, status: res.status, statusText: res.statusText, headers: [...res.headers.entries()], body },
-            [body],
-          );
+      const t0 = performance.now();
+      serveGuestFetch(msg)
+        .then((r) => {
+          const ms = performance.now() - t0;
+          if (ms > 1500) log("info", `${msg.method} ${msg.path} → ${r.status} (${(ms / 1000).toFixed(1)}s)`);
+          const body = r.body.slice(0); // a transferable copy; the cache keeps the original
+          post({ t: "fetchres", rid: msg.rid, status: r.status, statusText: r.statusText, headers: r.headers, body }, [body]);
         })
         .catch((e) => post({ t: "fetcherr", rid: msg.rid, message: e instanceof Error ? e.message : String(e) }));
       break;

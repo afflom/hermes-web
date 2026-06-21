@@ -43,7 +43,10 @@ export interface HoloWorkspace {
 const PUMP_BUDGET = 8_000_000; // instructions per tick — a chunk small enough to stay responsive to new
 // fetches/egress between bursts, large enough that per-tick JS overhead is negligible.
 const IDLE_MS = 6; // backoff cadence when FULLY idle (keeps egress connections responsive)
-const FETCH_TIMEOUT_MS = 180_000;
+// A guest request can be multi-minute when it hits a cold FastAPI endpoint (first-call route/Pydantic/
+// import cost) under interpretation. Don't fail those prematurely — the warm-κ bank makes them fast, and
+// the bridge cache makes repeats instant; this is the safety bound for a genuinely stuck request.
+const FETCH_TIMEOUT_MS = 300_000;
 
 interface PendingFetch {
   connId: number;
