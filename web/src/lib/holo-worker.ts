@@ -14,34 +14,18 @@ import type { EgressChannel } from "./holo-egress";
 import type { ToWorker, FromWorker } from "./holo-protocol";
 import type { HologramBootProgress } from "./holo-hologram-types";
 
-interface SyncAccessHandle {
-  write(buf: Uint8Array, opts?: { at?: number }): number;
-  truncate(n: number): void;
-  flush(): void;
-  close(): void;
-  getSize(): number;
-}
 interface HsModule {
   default: (input?: unknown) => Promise<unknown>;
   kappa: (bytes: Uint8Array) => string;
   Workspace: {
     resume_devcontainer_net_bridged: (snapshot: Uint8Array) => HoloWorkspace;
-    resume_devcontainer_net_bridged_streamed: (snapshot: SyncAccessHandle) => HoloWorkspace;
+    resume_devcontainer_net_bridged_fed: (next: () => Uint8Array) => HoloWorkspace;
   };
 }
 
 /** Surface a diagnostic line to the main thread (→ browser console). */
 function log(level: "info" | "warn" | "error" | "guest", msg: string) {
   post({ t: "log", level, msg });
-}
-
-/** Create a truncated OPFS sync access handle (worker-only) for `name`. */
-async function opfsHandle(name: string): Promise<SyncAccessHandle> {
-  const root = await navigator.storage.getDirectory();
-  const fh = await root.getFileHandle(name, { create: true });
-  const h = (await (fh as unknown as { createSyncAccessHandle: () => Promise<SyncAccessHandle> }).createSyncAccessHandle());
-  h.truncate(0);
-  return h;
 }
 
 const GUEST_PORT = 9119;
@@ -81,35 +65,32 @@ async function boot(_useOpfs: boolean): Promise<void> {
   );
   log("info", `warm machine loaded + verified, ${(snapshot.length / 1e6).toFixed(0)} MB (${since(tSnap)})`);
 
-  // DEFAULT resume = STREAMED into an in-wasm MemKappaStore: stage the snapshot in OPFS, FREE the JS
-  // copy, then resume by streaming it back — so the wasm heap never holds the 1.44 GB snapshot copy
-  // (the ~2.7 GB monolithic peak that aborts on refresh). The disk stays in-wasm, so serving is full
-  // speed. Falls back to the monolithic in-heap resume only if OPFS sync handles are unavailable.
-  let ws: HoloWorkspace;
-  let snap: SyncAccessHandle | null = null;
-  try {
-    snap = await opfsHandle("holo-snapshot.bin");
-  } catch (e) {
-    log("warn", `OPFS sync handles unavailable — falling back to in-heap resume: ${e}`);
-  }
+  // DEFAULT resume = FED from JS into an in-wasm MemKappaStore: hand wasm the snapshot one window at a
+  // time so the wasm heap never holds the whole 1.44 GB copy the monolithic resume needs (the ~2.7 GB
+  // peak that aborts on refresh). The feed is plain RAM copies — no OPFS round-trip — so it's as fast as
+  // the monolithic resume but peaks at ~1.4 GB. Disk stays in-wasm, so serving is full speed. Falls back
+  // to the monolithic resume only if the fed path is somehow unavailable.
+  report({ phase: "resume", detail: "resuming the warm machine (no cold boot)" });
   const tResume = performance.now();
-  if (snap) {
-    report({ phase: "disk", detail: "staging the warm machine in local storage" });
-    for (let off = 0; off < snapshot.length; off += 64 * 1024 * 1024) {
-      snap.write(snapshot.subarray(off, Math.min(off + 64 * 1024 * 1024, snapshot.length)), { at: off });
-    }
-    snap.flush();
-    snapshot = new Uint8Array(0); // free the 1.44 GB JS copy BEFORE the resume (it lives in OPFS now)
-    report({ phase: "resume", detail: "resuming the warm machine (low-memory streamed)" });
-    ws = hs.Workspace.resume_devcontainer_net_bridged_streamed(snap);
-    snap.close();
-    (await navigator.storage.getDirectory()).removeEntry("holo-snapshot.bin").catch(() => {});
-    log("info", `resumed (streamed, low-peak) in ${since(tResume)}`);
-  } else {
-    report({ phase: "resume", detail: "resuming the warm machine (no cold boot)" });
+  let ws: HoloWorkspace;
+  const FEED = 16 * 1024 * 1024;
+  let fedOff = 0;
+  const next = (): Uint8Array => {
+    if (fedOff >= snapshot.length) return new Uint8Array(0); // EOF
+    const end = Math.min(fedOff + FEED, snapshot.length);
+    const slice = snapshot.subarray(fedOff, end); // a view; wasm copies it in
+    fedOff = end;
+    return slice;
+  };
+  try {
+    ws = hs.Workspace.resume_devcontainer_net_bridged_fed(next);
+    log("info", `resumed (fed, low-peak) in ${since(tResume)}`);
+  } catch (e) {
+    log("warn", `fed resume failed (${e}); falling back to monolithic in-heap resume`);
     ws = hs.Workspace.resume_devcontainer_net_bridged(snapshot);
     log("info", `resumed (monolithic in-heap) in ${since(tResume)}`);
   }
+  snapshot = new Uint8Array(0); // free the 1.44 GB JS copy now that the machine is resumed
 
   // Egress proxy: the worker can't open sockets, so it relays frames to/from the main thread.
   const egress: EgressChannel = {

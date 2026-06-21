@@ -81,10 +81,10 @@ index 8ca6d25..038ba0f 100644
  name = "proc-macro2"
  version = "1.0.106"
 diff --git a/crates/holospaces-web/src/lib.rs b/crates/holospaces-web/src/lib.rs
-index bed80bd..9a87ded 100644
+index bed80bd..bc1a6eb 100644
 --- a/crates/holospaces-web/src/lib.rs
 +++ b/crates/holospaces-web/src/lib.rs
-@@ -47,7 +47,88 @@ use holospaces::assembly::{assemble_ext4, assemble_ext4_bootable, Layer};
+@@ -47,7 +47,152 @@ use holospaces::assembly::{assemble_ext4, assemble_ext4_bootable, Layer};
  use holospaces::boot::{devcontainer, provision, LifecycleError, ReadVerify, Resolver, Session};
  use holospaces::config::{Configuration, Directive, LifecycleAction};
  use holospaces::content_net::ContentPeer;
@@ -126,6 +126,70 @@ index bed80bd..9a87ded 100644
 +            filled += n;
 +        }
 +        Ok(())
++    }
++}
++/// A [`StreamRead`] fed by a JS callback that returns the next chunk of the snapshot — the worker slices
++/// its in-memory snapshot and hands wasm one window at a time. This lets `restore_net_streamed` parse the
++/// snapshot into RAM + an in-wasm MemKappaStore WITHOUT the monolithic `&[u8]` resume's full 1.44 GB copy
++/// in the wasm heap (the ~2.7 GB peak that trips the wasm32 ceiling and aborts on refresh). No OPFS round
++/// trip — the feed is RAM copies — so it's as fast as the monolithic resume but peaks at ~1.4 GB.
++struct FedReader {
++    next: js_sys::Function, // () -> Uint8Array (a zero-length array signals EOF)
++    buf: Vec<u8>,
++    consumed: usize,
++    eof: bool,
++}
++impl FedReader {
++    fn new(next: js_sys::Function) -> Self {
++        FedReader { next, buf: Vec::new(), consumed: 0, eof: false }
++    }
++    fn refill(&mut self) -> Result<(), SnapshotError> {
++        if self.eof {
++            return Ok(());
++        }
++        let chunk = self.next.call0(&JsValue::NULL).map_err(|_| SnapshotError::Truncated)?;
++        let arr = js_sys::Uint8Array::new(&chunk);
++        let len = arr.length() as usize;
++        if len == 0 {
++            self.eof = true;
++            return Ok(());
++        }
++        self.buf = vec![0u8; len];
++        arr.copy_to(&mut self.buf);
++        self.consumed = 0;
++        Ok(())
++    }
++}
++impl StreamRead for FedReader {
++    fn read_exact(&mut self, out: &mut [u8]) -> Result<(), SnapshotError> {
++        let mut filled = 0usize;
++        while filled < out.len() {
++            if self.consumed >= self.buf.len() {
++                self.refill()?;
++                if self.consumed >= self.buf.len() {
++                    return Err(SnapshotError::Truncated); // EOF before the request was satisfied
++                }
++            }
++            let n = (self.buf.len() - self.consumed).min(out.len() - filled);
++            out[filled..filled + n].copy_from_slice(&self.buf[self.consumed..self.consumed + n]);
++            self.consumed += n;
++            filled += n;
++        }
++        Ok(())
++    }
++    fn read_to_end(&mut self) -> Result<Vec<u8>, SnapshotError> {
++        let mut v = Vec::new();
++        v.extend_from_slice(&self.buf[self.consumed..]);
++        self.consumed = self.buf.len();
++        loop {
++            self.refill()?;
++            if self.eof || self.buf.is_empty() {
++                break;
++            }
++            v.extend_from_slice(&self.buf);
++            self.consumed = self.buf.len();
++        }
++        Ok(v)
 +    }
 +}
 +impl StreamRead for OpfsReader {
@@ -174,7 +238,7 @@ index bed80bd..9a87ded 100644
  use holospaces::identity::{Operator, Roster};
  use holospaces::machine::MachineSpec;
  use holospaces::oci::ImagePull;
-@@ -1342,6 +1423,45 @@ impl Workspace {
+@@ -1342,6 +1487,45 @@ impl Workspace {
          })
      }
  
@@ -220,7 +284,7 @@ index bed80bd..9a87ded 100644
      /// Drain the next egress frame the guest produced, for the page to carry to
      /// the router. `undefined` when none is queued (or this is not a routed boot).
      #[must_use]
-@@ -1389,6 +1509,118 @@ impl Workspace {
+@@ -1389,6 +1573,142 @@ impl Workspace {
          })
      }
  
@@ -320,6 +384,30 @@ index bed80bd..9a87ded 100644
 +    ) -> Result<Workspace, JsValue> {
 +        let base = MachineSpec::devcontainer().base;
 +        let mut reader = OpfsReader::new(snapshot_handle)?;
++        let disk_store = Box::new(MemKappaStore::new());
++        let mut machine = Emulator::restore_net_streamed(base, &mut reader, disk_store).map_err(js_err)?;
++        let (egress, router) = net::ChannelEgress::new();
++        machine.reattach_net_egress(Box::new(egress));
++        machine.enable_loopback();
++        Ok(Workspace {
++            machine,
++            store: MemKappaStore::new(),
++            channel: Vec::new(),
++            files: std::collections::BTreeMap::new(),
++            halted: false,
++            console_cursor: 0,
++            router: Some(router),
++        })
++    }
++
++    /// Resume by **feeding the κ-snapshot from JS memory in chunks** (`next` returns the next slice; a
++    /// zero-length array = EOF) into an in-wasm MemKappaStore. The PRODUCTION DEFAULT: as fast as the
++    /// monolithic resume (the feed is RAM copies — no OPFS round-trip) but the wasm heap never holds the
++    /// whole 1.44 GB snapshot, so the resume peaks at ~1.4 GB instead of ~2.7 GB and no longer aborts on
++    /// refresh. Egress + loopback are re-attached exactly as the monolithic path.
++    pub fn resume_devcontainer_net_bridged_fed(next: js_sys::Function) -> Result<Workspace, JsValue> {
++        let base = MachineSpec::devcontainer().base;
++        let mut reader = FedReader::new(next);
 +        let disk_store = Box::new(MemKappaStore::new());
 +        let mut machine = Emulator::restore_net_streamed(base, &mut reader, disk_store).map_err(js_err)?;
 +        let (egress, router) = net::ChannelEgress::new();

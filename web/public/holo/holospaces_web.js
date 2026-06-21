@@ -1784,6 +1784,22 @@ export class Workspace {
         return Workspace.__wrap(ret[0]);
     }
     /**
+     * Resume by **feeding the κ-snapshot from JS memory in chunks** (`next` returns the next slice; a
+     * zero-length array = EOF) into an in-wasm MemKappaStore. The PRODUCTION DEFAULT: as fast as the
+     * monolithic resume (the feed is RAM copies — no OPFS round-trip) but the wasm heap never holds the
+     * whole 1.44 GB snapshot, so the resume peaks at ~1.4 GB instead of ~2.7 GB and no longer aborts on
+     * refresh. Egress + loopback are re-attached exactly as the monolithic path.
+     * @param {Function} next
+     * @returns {Workspace}
+     */
+    static resume_devcontainer_net_bridged_fed(next) {
+        const ret = wasm.workspace_resume_devcontainer_net_bridged_fed(next);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return Workspace.__wrap(ret[0]);
+    }
+    /**
      * Resume like [`resume_devcontainer_net_bridged`](Workspace::resume_devcontainer_net_bridged), but
      * **stream the κ-snapshot from an OPFS file and page the guest disk into an OPFS κ-store** — so the
      * multi-hundred-MB disk NEVER lands on the wasm heap. Only RAM + the sparse disk index stay
@@ -2209,6 +2225,10 @@ function __wbg_get_imports() {
             const ret = arg0.addIceCandidate(arg1);
             return ret;
         },
+        __wbg_call_8a89609d89f6608a: function() { return handleError(function (arg0, arg1) {
+            const ret = arg0.call(arg1);
+            return ret;
+        }, arguments); },
         __wbg_call_9c758de292015997: function() { return handleError(function (arg0, arg1, arg2) {
             const ret = arg0.call(arg1, arg2);
             return ret;
