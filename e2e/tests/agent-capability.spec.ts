@@ -46,6 +46,7 @@ test.describe("Hermes agent backend (in-browser, over the loopback bridge)", () 
   let page: Page;
 
   test.beforeAll(async ({ browser }) => {
+    test.setTimeout(300_000); // resume is multi-minute; this hook owns the one boot for the whole suite
     page = await browser.newPage();
     await page.goto("./", { waitUntil: "load" });
     const has = await manifestPublished(page);

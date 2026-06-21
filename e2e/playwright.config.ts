@@ -11,7 +11,10 @@ const baseURL = LIVE || `http://localhost:${PORT}${PREFIX}/`;
 
 export default defineConfig({
   testDir: "./tests",
-  timeout: 60_000,
+  // Resuming the 1.44 GB warm machine in-browser is multi-minute; this is the test AND hook (beforeAll)
+  // budget — describe.configure({timeout}) does NOT raise the hook timeout, only this global value does.
+  // The fast substrate/shell tests still finish in seconds; this only bounds the worst case.
+  timeout: 300_000,
   expect: { timeout: 20_000 },
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
