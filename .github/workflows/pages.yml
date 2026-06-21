@@ -74,17 +74,6 @@ jobs:
           npx playwright test deployment.spec.ts
         working-directory: e2e
 
-      - name: Agent capability surface (per-endpoint probes — informational)
-        # Granular probes of individual /api endpoints over the loopback bridge. Some endpoints (e.g.
-        # /api/status, which gathers system metrics) are heavy under RISC-V emulation and can exceed the
-        # bridge's fetch budget on a loaded runner, so this is NON-BLOCKING — it exercises + reports the
-        # capability surface without gating the deploy (the fail-closed render gate above is the gate).
-        continue-on-error: true
-        run: |
-          if [ -f ../web/dist-pages/holo/warm/manifest.json ]; then export E2E_EXPECT_HOLOGRAM=1; fi
-          npx playwright test agent-capability.spec.ts
-        working-directory: e2e
-
       - name: Upload Playwright report on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -116,4 +105,17 @@ jobs:
           done
           if [ -f ../web/dist-pages/holo/warm/manifest.json ]; then export E2E_EXPECT_HOLOGRAM=1; fi
           E2E_BASE_URL="$URL" npx playwright test deployment.spec.ts
+        working-directory: e2e
+
+      - name: Agent capability surface against the LIVE deploy (per-endpoint probes — informational)
+        # Granular probes of individual /api endpoints over the loopback bridge, run POST-deploy so they
+        # never delay the deploy. NON-BLOCKING + time-capped: some endpoints (e.g. /api/status, which
+        # gathers system metrics) are heavy under RISC-V emulation and can exceed the bridge's fetch
+        # budget on a loaded runner. The fail-closed render gate + smoke above are the real gates.
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          URL="${{ steps.deployment.outputs.page_url }}"
+          if [ -f ../web/dist-pages/holo/warm/manifest.json ]; then export E2E_EXPECT_HOLOGRAM=1; fi
+          E2E_BASE_URL="$URL" npx playwright test agent-capability.spec.ts
         working-directory: e2e
