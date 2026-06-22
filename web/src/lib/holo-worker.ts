@@ -14,6 +14,8 @@ import type { EgressChannel } from "./holo-egress";
 import type { ToWorker, FromWorker } from "./holo-protocol";
 import type { HologramBootProgress } from "./holo-hologram-types";
 
+declare const __HOLO_ASSET_VER__: string; // build-time content hash of the wasm + glue (vite define)
+
 interface HsModule {
   default: (input?: unknown) => Promise<unknown>;
   kappa: (bytes: Uint8Array) => string;
@@ -187,8 +189,13 @@ async function boot(_useOpfs: boolean, diagMode?: string, egressIsAvailable = fa
   const since = (mark: number) => `${((performance.now() - mark) / 1000).toFixed(1)}s`;
 
   report({ phase: "wasm", detail: "loading the holospaces runtime" });
-  const hs = (await import(/* @vite-ignore */ holoUrl("holospaces_web.js"))) as HsModule;
-  await hs.default();
+  // Cache-bust the stable-URL wasm + glue by their build-time content hash: a returning browser otherwise
+  // loads a STALE cached runtime against the new worker → boot crash. Version the glue import AND pass the
+  // versioned wasm URL explicitly (wasm-bindgen's default wasm URL drops the glue's query, so it must be
+  // passed). Static hosting (Pages) ignores the query and serves the file.
+  const av = typeof __HOLO_ASSET_VER__ !== "undefined" && __HOLO_ASSET_VER__ ? `?v=${__HOLO_ASSET_VER__}` : "";
+  const hs = (await import(/* @vite-ignore */ holoUrl("holospaces_web.js") + av)) as HsModule;
+  await hs.default(av ? holoUrl("holospaces_web_bg.wasm") + av : undefined);
   log("info", `wasm runtime loaded (${since(t0)})`);
 
   report({ phase: "snapshot", detail: "fetching the warm Hermes machine" });

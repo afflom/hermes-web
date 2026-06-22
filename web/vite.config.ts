@@ -2,8 +2,27 @@ import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
+import { createHash } from "node:crypto";
+import { readFileSync, existsSync } from "node:fs";
 
 const BACKEND = process.env.HERMES_DASHBOARD_URL ?? "http://127.0.0.1:9119";
+
+// The holospaces wasm runtime + its JS glue ship in public/holo/ at STABLE URLs (not Vite-hashed). When they
+// change across deploys, a returning browser serves the stale cached copy against the new worker → boot
+// crash. Hash their contents at build time so the worker can cache-bust the load (?v=<hash>): immutable per
+// build, but any change yields fresh URLs that bypass the browser + Pages/Fastly cache.
+function holoAssetVer(): string {
+  try {
+    const h = createHash("sha256");
+    for (const f of ["public/holo/holospaces_web_bg.wasm", "public/holo/holospaces_web.js"]) {
+      const p = path.resolve(__dirname, f);
+      if (existsSync(p)) h.update(readFileSync(p));
+    }
+    return h.digest("hex").slice(0, 12);
+  } catch {
+    return "0";
+  }
+}
 
 /**
  * In production the Python `hermes dashboard` server injects a one-shot
@@ -75,6 +94,8 @@ export default defineConfig({
     // (empty states, inert sockets) instead of `origin` when the launcher injects no guest bridge. The
     // server build leaves this false → `origin` → the real Python `hermes dashboard` /api backend.
     __HERMES_HOLO_BUILD__: JSON.stringify(process.env.HERMES_HOLO_BASE != null),
+    // Content hash of the holospaces wasm + glue, for cache-busting their stable-URL load in the worker.
+    __HOLO_ASSET_VER__: JSON.stringify(holoAssetVer()),
   },
   plugins: [react(), tailwindcss(), hermesDevToken()],
   resolve: {
