@@ -103,6 +103,7 @@ function onWorkerMessage(ev: MessageEvent<FromWorker>, onReady: (token: string) 
     case "wserr": { const s = liveSockets.get(m.sid); if (s) s._emit("error", { type: "error", data: m.message }); break; }
     case "egressout": egress?.send(m.frame); break; // carry the guest's frame to the extension
     case "apiok": (window as unknown as Record<string, unknown>).__HOLO_API_OK__ = m.ok; break;
+    case "peakbytes": (window as unknown as Record<string, unknown>).__HOLO_PEAK_BYTES__ = m.bytes; break;
     case "log": {
       // Surface worker/guest diagnostics to the browser console (prefixed so they're filterable).
       if (m.level === "guest") for (const line of m.msg.split("\n")) console.log("%c[hermes]", "color:#7c3aed", line);

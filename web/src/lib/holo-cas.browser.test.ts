@@ -1,5 +1,12 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { loadWarmSnapshot } from "./holo-cas";
+import { blake3 } from "@noble/hashes/blake3.js";
+import { ungzip } from "pako";
+import { loadWarmSnapshot, loadWarmChunks } from "./holo-cas";
+
+/** The REAL substrate κ (blake3 over the bytes) — what loadWarmChunks verifies against (no passed-in fn). */
+function realKappa(bytes: Uint8Array): string {
+  return `blake3:${Array.from(blake3(bytes), (b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
 
 // The content-addressed warm-κ codec, evaluated in a REAL browser — it relies on browser APIs
 // (CompressionStream/DecompressionStream, fetch, OPFS) that don't exist in node. We mock only the
@@ -22,7 +29,7 @@ async function gzip(b: Uint8Array): Promise<Uint8Array> {
 }
 
 /** Build a snapshot + its CAS (manifest + gzipped chunks) and a fetch that serves them. */
-async function buildCas(snapshot: Uint8Array, chunkSize: number) {
+async function buildCas(snapshot: Uint8Array, chunkSize: number, kappaFn: (b: Uint8Array) => string = fakeKappa) {
   const chunks: { name: string; size: number }[] = [];
   const gzByName = new Map<string, Uint8Array>();
   for (let off = 0, i = 0; off < snapshot.length; off += chunkSize, i++) {
@@ -31,7 +38,7 @@ async function buildCas(snapshot: Uint8Array, chunkSize: number) {
     chunks.push({ name, size: raw.length });
     gzByName.set(name, await gzip(raw));
   }
-  const manifest = { kappa: fakeKappa(snapshot), size: snapshot.length, chunkGzip: true, chunks };
+  const manifest = { kappa: kappaFn(snapshot), size: snapshot.length, chunkGzip: true, chunks };
   const fetchImpl = vi.fn(async (url: string) => {
     const u = String(url);
     if (u.endsWith("manifest.json")) return new Response(JSON.stringify(manifest), { status: 200 });
@@ -76,5 +83,35 @@ describe("loadWarmSnapshot (browser CAS codec)", () => {
   it("throws a clear error when no warm-κ manifest is published (404)", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 404 })));
     await expect(loadWarmSnapshot(fakeKappa)).rejects.toThrow(/no warm-κ manifest/i);
+  });
+});
+
+describe("loadWarmChunks (streaming low-memory CAS codec)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("streams the COMPRESSED chunks + verifies the κ incrementally by re-derivation (Law L5)", async () => {
+    const snapshot = new Uint8Array(70_000);
+    for (let i = 0; i < snapshot.length; i++) snapshot[i] = (i * 31 + 7) & 0xff;
+    const { fetchImpl, manifest } = await buildCas(snapshot, 16_384, realKappa);
+    expect(manifest.chunks.length).toBeGreaterThan(1);
+    vi.stubGlobal("fetch", fetchImpl);
+
+    const { gz, gzip, total } = await loadWarmChunks();
+    expect(total).toBe(snapshot.length);
+    expect(gzip).toBe(true);
+    // The whole snapshot is NEVER materialized; it's held compressed. Inflate the chunks to confirm fidelity.
+    const recon = new Uint8Array(total);
+    for (let i = 0, off = 0; i < gz.length; i++) { const raw = ungzip(gz[i]!); recon.set(raw, off); off += raw.length; }
+    expect(realKappa(recon)).toBe(manifest.kappa);
+  });
+
+  it("REFUSES a tampered chunk (incremental re-derivation no longer matches the recorded κ)", async () => {
+    const snapshot = new Uint8Array(40_000).map((_, i) => (i * 13) & 0xff);
+    const { fetchImpl, gzByName } = await buildCas(snapshot, 16_384, realKappa);
+    const first = [...gzByName.keys()][0];
+    gzByName.set(first, await gzip(new Uint8Array(16_384).fill(0xab)));
+    vi.stubGlobal("fetch", fetchImpl);
+
+    await expect(loadWarmChunks()).rejects.toThrow(/re-derivation|size mismatch/i);
   });
 });

@@ -13,6 +13,9 @@
 // the recorded κ (`hs.kappa`, the substrate default axis = blake3 — the exact label the banking step
 // `cargo run --example kappa_of` records). Equal load order, equal bytes, equal κ.
 
+import { blake3 } from "@noble/hashes/blake3.js";
+import { ungzip } from "pako";
+
 export interface WarmManifest {
   /** The substrate κ-label of the whole snapshot (`blake3:<hex>`) — the only trust anchor. */
   kappa: string;
@@ -127,6 +130,49 @@ async function persistCache(kappa: string, snapshot: Uint8Array, onProgress: OnP
 function warmUrl(rel: string): string {
   const base = (import.meta as { env?: { BASE_URL?: string } }).env?.BASE_URL ?? "/";
   return `${base}holo/warm/${rel}`.replace(/([^:])\/\//g, "$1/");
+}
+
+/**
+ * STREAMING warm-κ load — the low-memory path. Returns the snapshot as an ARRAY of chunk buffers (never
+ * concatenated into one 1.9 GB allocation) and verifies the κ INCREMENTALLY: each chunk feeds a streaming
+ * blake3 (the κ is plain blake3 over the snapshot bytes — empirically confirmed), so the Law-L5 re-derivation
+ * holds WITHOUT ever copying the whole snapshot into wasm (`hs.kappa` would). The caller feeds the resume
+ * window-by-window and frees each chunk as it goes, so neither JS nor wasm ever holds the full 1.9 GB — the
+ * peak drops from ~3.8 GB (verify-copy + held buffer) to ~1.9 GB, which is what lets memory-limited tabs boot.
+ */
+export interface WarmChunks { gz: (Uint8Array | null)[]; gzip: boolean; total: number }
+export async function loadWarmChunks(onProgress: OnProgress = () => {}): Promise<WarmChunks> {
+  onProgress({ phase: "manifest", detail: "fetching warm-κ manifest" });
+  const res = await fetch(warmUrl("manifest.json"), { cache: "no-cache" });
+  if (!res.ok) throw new Error(`no warm-κ manifest (${res.status}) — bank it with the guest witness + chunker`);
+  const manifest = (await res.json()) as WarmManifest;
+  if (!manifest.kappa || !Array.isArray(manifest.chunks) || manifest.chunks.length === 0) {
+    throw new Error("warm-κ manifest is malformed (missing kappa/chunks)");
+  }
+  const ver = (manifest.kappa.match(/[0-9a-f]{8,}/i)?.[0] ?? manifest.kappa).slice(0, 16); // cache-bust per κ
+  const hasher = blake3.create();
+  // Keep the COMPRESSED chunks (~390 MB) — NOT the 1.9 GB of decompressed bytes. Each is decompressed once
+  // here only to feed the incremental κ verify, then the raw is dropped; the caller re-inflates on-demand
+  // during the feed (one chunk at a time). So the JS side never holds the whole snapshot → ~1.9 GB peak.
+  const gz: (Uint8Array | null)[] = [];
+  for (let i = 0; i < manifest.chunks.length; i++) {
+    const c = manifest.chunks[i];
+    onProgress({ phase: "chunk", fraction: i / manifest.chunks.length, detail: `fetching warm machine ${i + 1}/${manifest.chunks.length}` });
+    const cr = await fetch(`${warmUrl(`chunks/${c.name}`)}?v=${ver}`, { cache: "force-cache" });
+    if (!cr.ok) throw new Error(`warm-κ chunk ${c.name} fetch failed (${cr.status})`);
+    const comp = new Uint8Array(await cr.arrayBuffer());
+    const raw = manifest.chunkGzip ? ungzip(comp) : comp; // decompress to VERIFY only; raw is GC'd after update
+    if (raw.length !== c.size) throw new Error(`warm-κ chunk ${c.name} size mismatch`);
+    hasher.update(raw); // incremental Law-L5 verify — no whole-snapshot materialization
+    gz.push(manifest.chunkGzip ? comp : raw);
+  }
+  // Law L5 — the SINGLE trust anchor: the streamed whole must re-derive to the recorded substrate κ.
+  onProgress({ phase: "verify", detail: "verifying warm machine by re-derivation (Law L5)" });
+  const hex = Array.from(hasher.digest(), (b) => b.toString(16).padStart(2, "0")).join("");
+  if (`blake3:${hex}` !== manifest.kappa) {
+    throw new Error(`warm-κ failed re-derivation: got blake3:${hex}, expected ${manifest.kappa}`);
+  }
+  return { gz, gzip: manifest.chunkGzip, total: manifest.size };
 }
 
 /** One bank-captured dashboard read: the warm κ's already-computed response (body is lowercase hex). */

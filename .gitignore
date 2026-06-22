@@ -150,3 +150,5 @@ vv/witness/*.log
 vv/witness/*.tar
 vv/witness/*.kappa
 vv/witness/hermes-riscv64-oci/
+web/src/lib/__screenshots__/
+web/.vitest-attachments/

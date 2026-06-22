@@ -73,7 +73,9 @@ test("the in-browser holospaces backend resumes, authenticates, and renders the 
   // (its injected token reaches window.__HERMES_SESSION_TOKEN__), and the real dashboard renders against
   // it. Hard-required when E2E_EXPECT_HOLOGRAM=1; otherwise skipped until the κ is shipped.
   const expectHologram = process.env.E2E_EXPECT_HOLOGRAM === "1";
-  test.setTimeout(300_000); // first load fetches + resumes the 1.44 GB warm machine (~75 s)
+  test.setTimeout(600_000); // TWO full boots (initial + the /models deep-link reload), each ~170 s with the
+  // low-memory streaming load (incremental JS blake3 verify + on-demand inflate trade boot time for a ~2.3 GB
+  // peak instead of ~3.3 GB).
   // Surface the in-browser boot to the CI log — the worker relays [holo]/[hermes] boot timings + errors;
   // if READY never arrives we can see exactly where it stalled (resume vs auth) instead of a blind timeout.
   page.on("console", (m) => recordConsole(`[browser:${m.type()}] ${m.text()}`));
@@ -102,7 +104,7 @@ test("the in-browser holospaces backend resumes, authenticates, and renders the 
   // Poll the on-window boot beacons (phase/detail/elapsed) every 3 s so a stall is fully diagnosed — we
   // see exactly which phase froze (resume vs token/auth) and the worker's pump metrics — instead of a
   // blind waitForFunction timeout. page.evaluate is reliable even when page.on("console") drops worker logs.
-  const DEADLINE = Date.now() + 180_000;
+  const DEADLINE = Date.now() + 260_000; // streaming low-mem load (JS blake3 + decompress) is slower but bounded
   let ready = false;
   let lastBeacon = "";
   while (Date.now() < DEADLINE) {
@@ -123,10 +125,23 @@ test("the in-browser holospaces backend resumes, authenticates, and renders the 
   }
   if (!ready) {
     recordConsole(`[boot] STALLED — last beacon: ${lastBeacon}`);
-    throw new Error(`backend never became ready (180s); last boot beacon: ${lastBeacon}`);
+    throw new Error(`backend never became ready (260s); last boot beacon: ${lastBeacon}`);
   }
   const token = await page.evaluate(() => (window as unknown as { __HERMES_SESSION_TOKEN__?: string }).__HERMES_SESSION_TOKEN__);
   expect(typeof token === "string" && token.length > 0, "in-guest session token adopted").toBe(true);
+
+  // FAIL-CLOSED memory gate: the boot must never materialize the whole snapshot in JS *and* wasm at once.
+  // The worker measures the true peak (live JS bytes held + wasm linear-memory size) across the streamed
+  // resume and beacons it. A regression to holding the full 1.9 GB buffer (or a wasm κ-verify copy) pushes
+  // the peak to ~3+ GB and OOM-crashes memory-limited tabs — so we cap it well under that. This is what
+  // keeps the streaming load from silently regressing.
+  const peakBytes = await page.evaluate(() => (window as unknown as { __HOLO_PEAK_BYTES__?: number }).__HOLO_PEAK_BYTES__);
+  expect(typeof peakBytes === "number" && peakBytes > 0, "boot peak-memory beacon present").toBe(true);
+  recordConsole(`[boot] peak memory (JS+wasm) = ${((peakBytes as number) / 1e6).toFixed(0)} MB`);
+  const PEAK_BUDGET = 2_500_000_000; // 2.5 GB — above the ~2.3 GB streamed floor (wasm machine + transient),
+  // far below the ~3.3-3.8 GB peak of the old path that OOM-crashed memory-limited tabs. Catches a regression
+  // to materializing the whole snapshot (held buffer or wasm κ-verify copy).
+  expect(peakBytes as number, `boot peak memory must stay under ${PEAK_BUDGET / 1e9} GB (got ${((peakBytes as number) / 1e9).toFixed(2)} GB)`).toBeLessThan(PEAK_BUDGET);
 
   // The real dashboard is now mounted against the in-browser backend: chrome + sidebar nav, not a stub.
   await page.waitForFunction("(document.querySelector('#root')?.childElementCount ?? 0) > 0");
@@ -138,6 +153,6 @@ test("the in-browser holospaces backend resumes, authenticates, and renders the 
 
   // Client-side routing works under the project subpath (SPA fallback + router basename keep /hermes-web).
   await page.goto("models", { waitUntil: "load" });
-  await page.waitForFunction("window.__HOLO_BACKEND_READY__ === true", null, { timeout: 180_000 });
+  await page.waitForFunction("window.__HOLO_BACKEND_READY__ === true", null, { timeout: 260_000 });
   expect(new URL(page.url()).pathname).toMatch(/\/models$/);
 });

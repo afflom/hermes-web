@@ -31,4 +31,5 @@ export type FromWorker =
   | { t: "wserr"; sid: number; message: string }
   | { t: "egressout"; frame: Uint8Array } // a guest frame to carry to the extension
   | { t: "apiok"; ok: boolean } // background /api/status verification result
+  | { t: "peakbytes"; bytes: number } // boot memory peak (JS bytes held + wasm memory) — gated by the BDD
   | { t: "log"; level: "info" | "warn" | "error" | "guest"; msg: string }; // surfaced diagnostics

@@ -8,7 +8,8 @@
 // The worker can't reach the router extension (chrome.runtime is main-thread only), so egress frames are
 // relayed: the worker posts guest frames out and feeds reply frames the main thread carries back.
 
-import { loadWarmSnapshot, loadWarmResponses, type WarmLoadProgress } from "./holo-cas";
+import { ungzip } from "pako";
+import { loadWarmChunks, loadWarmResponses, type WarmLoadProgress } from "./holo-cas";
 import { BridgeRuntime, type HoloWorkspace, type RuntimeSocket } from "./holo-runtime";
 import type { EgressChannel } from "./holo-egress";
 import type { ToWorker, FromWorker } from "./holo-protocol";
@@ -195,44 +196,65 @@ async function boot(_useOpfs: boolean, diagMode?: string, egressIsAvailable = fa
   // passed). Static hosting (Pages) ignores the query and serves the file.
   const av = typeof __HOLO_ASSET_VER__ !== "undefined" && __HOLO_ASSET_VER__ ? `?v=${__HOLO_ASSET_VER__}` : "";
   const hs = (await import(/* @vite-ignore */ holoUrl("holospaces_web.js") + av)) as HsModule;
-  await hs.default(av ? holoUrl("holospaces_web_bg.wasm") + av : undefined);
+  // hs.default() returns the wasm exports — keep them so the boot can sample the wasm linear-memory size
+  // (the real footprint, alongside the JS bytes held) and gate the peak.
+  const wasmExports = (await hs.default(av ? holoUrl("holospaces_web_bg.wasm") + av : undefined)) as { memory: WebAssembly.Memory };
+  const wasmBytes = (): number => wasmExports?.memory?.buffer?.byteLength ?? 0;
   log("info", `wasm runtime loaded (${since(t0)})`);
 
+  // STREAMING low-peak load: fetch the COMPRESSED chunks (~390 MB total, never the 1.9 GB of raw) + verify
+  // the κ incrementally (JS blake3, no wasm verify-copy). See holo-cas.loadWarmChunks.
   report({ phase: "snapshot", detail: "fetching the warm Hermes machine" });
   const tSnap = performance.now();
-  let snapshot = await loadWarmSnapshot(
-    (b) => hs.kappa(b),
+  const { gz, gzip, total } = await loadWarmChunks(
     (p: WarmLoadProgress) =>
-      report({ phase: p.phase === "verify" || p.phase === "persist" ? "resume" : "snapshot", detail: p.detail, fraction: p.fraction }),
+      report({ phase: p.phase === "verify" ? "resume" : "snapshot", detail: p.detail, fraction: p.fraction }),
   );
-  log("info", `warm machine loaded + verified, ${(snapshot.length / 1e6).toFixed(0)} MB (${since(tSnap)})`);
+  log("info", `warm machine fetched + verified, ${(total / 1e6).toFixed(0)} MB (${since(tSnap)})`);
 
-  // DEFAULT resume = FED from JS into an in-wasm MemKappaStore: hand wasm the snapshot one window at a
-  // time so the wasm heap never holds the whole 1.44 GB copy the monolithic resume needs (the ~2.7 GB
-  // peak that aborts on refresh). The feed is plain RAM copies — no OPFS round-trip — so it's as fast as
-  // the monolithic resume but peaks at ~1.4 GB. Disk stays in-wasm, so serving is full speed. Falls back
-  // to the monolithic resume only if the fed path is somehow unavailable.
+  // Resume = FED, fed window-by-window. Each compressed chunk is INFLATED on demand (one at a time) and
+  // freed once consumed, so the JS side holds only the shrinking compressed array (~390 MB) plus one raw
+  // chunk (~50 MB) — never the whole 1.9 GB. The wasm heap grows to the machine size (~1.85 GB) as the disk
+  // is fed; they never coexist at full size → peak ~1.9 GB (the machine floor), not ~3.3 GB. We sample
+  // (live JS bytes + wasm memory) on each window so the true peak is measured and gated (deployment.spec).
   report({ phase: "resume", detail: "resuming the warm machine (no cold boot)" });
   const tResume = performance.now();
   let ws: HoloWorkspace;
   const FEED = 16 * 1024 * 1024;
-  let fedOff = 0;
-  const next = (): Uint8Array => {
-    if (fedOff >= snapshot.length) return new Uint8Array(0); // EOF
-    const end = Math.min(fedOff + FEED, snapshot.length);
-    const slice = snapshot.subarray(fedOff, end); // a view; wasm copies it in
-    fedOff = end;
-    return slice;
+  let ci = 0;
+  let cOff = 0;
+  let curRaw: Uint8Array | null = null; // the currently-inflated chunk
+  let peakBytes = 0;
+  const sample = (): void => {
+    let live = curRaw?.length ?? 0;
+    for (let i = ci; i < gz.length; i++) live += gz[i]?.length ?? 0;
+    const tot = live + wasmBytes();
+    if (tot > peakBytes) peakBytes = tot;
   };
-  try {
-    ws = hs.Workspace.resume_devcontainer_net_bridged_fed(next);
-    log("info", `resumed (fed, low-peak) in ${since(tResume)}`);
-  } catch (e) {
-    log("warn", `fed resume failed (${e}); falling back to monolithic in-heap resume`);
-    ws = hs.Workspace.resume_devcontainer_net_bridged(snapshot);
-    log("info", `resumed (monolithic in-heap) in ${since(tResume)}`);
-  }
-  snapshot = new Uint8Array(0); // free the 1.44 GB JS copy now that the machine is resumed
+  sample(); // pre-resume baseline (compressed array + wasm base)
+  const next = (): Uint8Array => {
+    for (;;) {
+      if (curRaw === null) {
+        if (ci >= gz.length) return new Uint8Array(0); // EOF
+        const comp = gz[ci]!;
+        curRaw = gzip ? ungzip(comp) : comp; // inflate this chunk on demand
+        gz[ci] = null; // free the compressed bytes now that we've inflated them
+        cOff = 0;
+      }
+      if (cOff < curRaw.length) break;
+      curRaw = null; // current chunk fully fed → drop it, advance
+      ci++;
+    }
+    const end = Math.min(cOff + FEED, curRaw.length);
+    const win = curRaw.subarray(cOff, end); // a view; the fed resume copies it in
+    cOff = end;
+    sample();
+    return win;
+  };
+  ws = hs.Workspace.resume_devcontainer_net_bridged_fed(next);
+  for (let i = 0; i < gz.length; i++) gz[i] = null; // ensure everything is freed
+  log("info", `resumed (streamed-fed) in ${since(tResume)}, peak ${(peakBytes / 1e6).toFixed(0)} MB`);
+  post({ t: "peakbytes", bytes: peakBytes });
 
   // DIFFERENTIAL DIAGNOSTIC (?holo-diag=digests): emit the wasm side of the native↔wasm equivalence
   // harness. Same restored machine + same loopback input + same per-step budget MUST yield the same full

@@ -73,7 +73,7 @@ async function bootBackend(page: Page): Promise<void> {
   expect(hasManifest, "warm-κ manifest must be published").toBe(true);
 
   // Pre-settled κ resumes ready and serves immediately; allow generous time for the first cold CAS fetch.
-  const DEADLINE = Date.now() + 180_000;
+  const DEADLINE = Date.now() + 260_000; // streaming low-mem load (JS blake3 + decompress) is slower but bounded
   let ready = false;
   while (Date.now() < DEADLINE) {
     const b = await page.evaluate(() => {
