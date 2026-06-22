@@ -143,3 +143,10 @@ web/dist-pages/
 
 # scratch reference clones (never committed)
 .holo-ref/
+
+# holospaces witness scratch — large build artifacts (image tar, raw warm κ, logs); the
+# shippable, content-addressed warm-κ CAS lives under web/public/holo/warm/ instead.
+vv/witness/*.log
+vv/witness/*.tar
+vv/witness/*.kappa
+vv/witness/hermes-riscv64-oci/

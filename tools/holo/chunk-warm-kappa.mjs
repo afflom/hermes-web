@@ -11,7 +11,7 @@
 //     snapshot  default vv/witness/hermes-warm.kappa
 //     out-dir   default web/public/holo/warm     (copied into the Pages build by Vite)
 //     kappa     the substrate κ-label (blake3:…); if omitted, computed via the `kappa_of` example.
-import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
@@ -28,7 +28,9 @@ if (!existsSync(snapPath)) {
   process.exit(1);
 }
 
-const snapshot = readFileSync(snapPath);
+// The snapshot can exceed Node's 2 GiB single-buffer limit (the bigger writable disk → ~2.2 GB κ), so we
+// never load it whole — positional reads stream one CHUNK at a time below.
+const snapSize = statSync(snapPath).size;
 
 // The recorded κ must be the SUBSTRATE address (blake3) — the exact label `hs.kappa` re-derives in the
 // browser. Compute it with the holospaces `kappa_of` example unless supplied.
@@ -57,23 +59,48 @@ mkdirSync(path.join(outDir, "chunks"), { recursive: true });
 // substrate check the browser makes: the reassembled whole must re-derive to `kappa` (Law L5).
 const chunks = [];
 let gzTotal = 0;
-for (let off = 0, i = 0; off < snapshot.length; off += CHUNK, i++) {
-  const raw = snapshot.subarray(off, Math.min(off + CHUNK, snapshot.length));
-  const name = String(i).padStart(5, "0");
-  const gz = gzipSync(raw, { level: 9 });
-  writeFileSync(path.join(outDir, "chunks", name), gz);
-  chunks.push({ name, size: raw.length });
-  gzTotal += gz.length;
-  if (gz.length > 95 * 1024 * 1024) {
-    console.error(`chunk-warm-kappa: chunk ${name} gzips to ${gz.length} bytes (> 95 MB) — lower CHUNK`);
-    process.exit(1);
+const fd = openSync(snapPath, "r");
+const buf = Buffer.allocUnsafe(CHUNK);
+try {
+  for (let off = 0, i = 0; off < snapSize; off += CHUNK, i++) {
+    const want = Math.min(CHUNK, snapSize - off);
+    let got = 0;
+    while (got < want) {
+      const n = readSync(fd, buf, got, want - got, off + got); // positional, no whole-file load
+      if (n === 0) break;
+      got += n;
+    }
+    const raw = buf.subarray(0, got);
+    const name = String(i).padStart(5, "0");
+    const gz = gzipSync(raw, { level: 9 });
+    writeFileSync(path.join(outDir, "chunks", name), gz);
+    chunks.push({ name, size: got });
+    gzTotal += gz.length;
+    if (gz.length > 95 * 1024 * 1024) {
+      console.error(`chunk-warm-kappa: chunk ${name} gzips to ${gz.length} bytes (> 95 MB) — lower CHUNK`);
+      process.exit(1);
+    }
   }
+} finally {
+  closeSync(fd);
 }
 
-const manifest = { kappa, size: snapshot.length, chunkGzip: true, chunks };
+const manifest = { kappa, size: snapSize, chunkGzip: true, chunks };
 writeFileSync(path.join(outDir, "manifest.json"), JSON.stringify(manifest, null, 2));
+
+// k-aligned read seed: vendor the warm κ's bank-captured dashboard responses (cc_capture_responses) next to
+// the κ. The browser seeds its read-cache from this so the dashboard reads the κ instantly instead of
+// re-computing each GET through the (serialized, one-connection) guest. Optional — older κ may not have it.
+const responsesSrc = path.join(path.dirname(snapPath), "warm-responses.json");
+if (existsSync(responsesSrc)) {
+  const bytes = readFileSync(responsesSrc);
+  writeFileSync(path.join(outDir, "warm-responses.json"), bytes);
+  console.log(`  + warm-responses.json (${(bytes.length / 1024).toFixed(0)} KB) — k-aligned read seed`);
+} else {
+  console.warn("  ! no warm-responses.json — run cc_capture_responses so the dashboard reads from κ (not the slow guest)");
+}
 
 const mb = (n) => (n / 1024 / 1024).toFixed(1);
 console.log(`✓ warm κ chunked → ${path.relative(ROOT, outDir)}`);
 console.log(`  κ=${kappa}`);
-console.log(`  snapshot ${mb(snapshot.length)} MB → ${chunks.length} chunks, ${mb(gzTotal)} MB gzipped on the wire`);
+console.log(`  snapshot ${mb(snapSize)} MB → ${chunks.length} chunks, ${mb(gzTotal)} MB gzipped on the wire`);

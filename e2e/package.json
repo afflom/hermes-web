@@ -6,6 +6,9 @@
   "type": "module",
   "scripts": {
     "test": "playwright test",
+    "e2e": "./run.sh",
+    "e2e:build": "BUILD=1 ./run.sh",
+    "doctor": "./run.sh doctor",
     "install-browser": "playwright install chromium"
   },
   "devDependencies": {

@@ -109,6 +109,11 @@ function onWorkerMessage(ev: MessageEvent<FromWorker>, onReady: (token: string) 
       else if (m.level === "error") console.error("[holo]", m.msg);
       else if (m.level === "warn") console.warn("[holo]", m.msg);
       else console.info("[holo]", m.msg);
+      // Mirror the boot/auth diagnostic onto window so e2e can read it via page.evaluate even when the
+      // reporter drops worker console output (Playwright's `list` reporter buffers/drops it locally).
+      if (/^(auth wait:|resumed|warm machine|wasm runtime|in-guest server)/.test(m.msg)) {
+        (window as unknown as Record<string, unknown>).__HOLO_DIAG__ = `${m.msg}`;
+      }
       break;
     }
   }
@@ -157,7 +162,14 @@ export async function bootWorkerTransport(report: (p: HologramBootProgress) => v
     // OPFS disk paging is opt-in (?holo-resume=opfs): lower memory but currently slower than the
     // default monolithic resume. The default ships the proven, fast path.
     const opfs = typeof location !== "undefined" && new URLSearchParams(location.search).get("holo-resume") === "opfs";
-    send({ t: "boot", base: HERMES_BASE_PATH, opfs });
+    // The page query string is invisible inside the worker (its `location` is the worker script URL), so
+    // read diagnostic flags here on the main thread and pass them in the boot message.
+    const diag = typeof location !== "undefined" ? new URLSearchParams(location.search).get("holo-diag") ?? undefined : undefined;
+    // Tell the worker whether the router extension is wired. Egress-prober endpoints (model/info, skills
+    // hub, mcp/messaging probes) BLOCK in the guest waiting for a network reply; with no gateway that reply
+    // never comes and the stuck handler holds the guest's single serving slot, poisoning every later read.
+    // When egress is absent the worker fails those fast (503) instead of dialing the guest.
+    send({ t: "boot", base: HERMES_BASE_PATH, opfs, diag, egressAvailable: !!egress });
   });
 }
 

@@ -30,7 +30,10 @@ import type { EgressChannel } from "./holo-egress";
 /** The holospaces-web `Workspace` surface the runtime drives (snake_case wasm-bindgen exports). */
 export interface HoloWorkspace {
   run(budget: number): boolean;
+  state_digest(): string; // sha256 of a full snapshot — deterministic fingerprint for native↔wasm diff
   terminal_delta(): string; // guest console bytes since the last call (the in-guest server/agent logs)
+  set_egress_none(): void; // fail-fast outbound (no router peer) so the guest never hangs on egress
+  set_egress_channel(): void; // (re)attach routed egress once a router (extension/native gateway) is present
   dial_guest(port: number): number | undefined;
   guest_send(id: number, data: Uint8Array): void;
   guest_recv(id: number): Uint8Array;
@@ -43,10 +46,12 @@ export interface HoloWorkspace {
 const PUMP_BUDGET = 8_000_000; // instructions per tick — a chunk small enough to stay responsive to new
 // fetches/egress between bursts, large enough that per-tick JS overhead is negligible.
 const IDLE_MS = 6; // backoff cadence when FULLY idle (keeps egress connections responsive)
-// A guest request can be multi-minute when it hits a cold FastAPI endpoint (first-call route/Pydantic/
-// import cost) under interpretation. Don't fail those prematurely — the warm-κ bank makes them fast, and
-// the bridge cache makes repeats instant; this is the safety bound for a genuinely stuck request.
-const FETCH_TIMEOUT_MS = 300_000;
+// Default safety bound for a stuck loopback request. Kept modest because the guest serves ONE connection at
+// a time — a hung request (e.g. an egress endpoint with no gateway wired) HOLDS the single lane and starves
+// every read behind it, so it must free up quickly. Genuinely slow-but-progressing reads are warm (the κ
+// bank) or cached; the rare heavy handler (/api/status, ~130 s interpreter-bound) passes a longer override
+// via `holoTimeoutMs`.
+const FETCH_TIMEOUT_MS = 120_000;
 
 interface PendingFetch {
   connId: number;
@@ -54,6 +59,7 @@ interface PendingFetch {
   resolve: (r: Response) => void;
   reject: (e: Error) => void;
   startedAt: number;
+  timeoutMs: number;
 }
 
 type SockListener = (ev: { type: string; data?: unknown; code?: number; reason?: string }) => void;
@@ -94,6 +100,14 @@ export class BridgeRuntime {
     this.running = false;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
+  }
+
+  /** Switch the egress backend: "none" = fail-fast (no router peer), "channel" = routed to the page's
+   *  router (extension/native gateway). The guest must never be left on routed egress with no relay —
+   *  outbound would hang forever (stalling the asyncio loop, e.g. auth). */
+  setEgress(mode: "none" | "channel"): void {
+    if (mode === "none") this.ws.set_egress_none();
+    else this.ws.set_egress_channel();
   }
 
   /** Guest console output since the last call — the in-guest server/agent's own logs, for surfacing. */
@@ -173,7 +187,7 @@ export class BridgeRuntime {
     const chunk = this.ws.guest_recv(f.connId);
     const closed = !this.ws.guest_is_open(f.connId);
     if (!chunk.length && !closed) {
-      if (Date.now() - f.startedAt > FETCH_TIMEOUT_MS) {
+      if (Date.now() - f.startedAt > f.timeoutMs) {
         this.ws.guest_close(f.connId);
         this.fetches.delete(f);
         f.reject(new Error("hologram fetch timed out"));
@@ -220,11 +234,12 @@ export class BridgeRuntime {
             ? undefined
             : String(init.body);
 
+    const timeoutMs = (init as { holoTimeoutMs?: number } | undefined)?.holoTimeoutMs ?? FETCH_TIMEOUT_MS;
     const connId = this.ws.dial_guest(this.port);
     if (connId == null) return Promise.reject(new Error("loopback ingress not enabled on this guest"));
     this.ws.guest_send(connId, encodeHttpRequest({ method, path, headers, body }));
     return new Promise<Response>((resolve, reject) => {
-      this.fetches.add({ connId, buf: new Uint8Array(0), resolve, reject, startedAt: Date.now() });
+      this.fetches.add({ connId, buf: new Uint8Array(0), resolve, reject, startedAt: Date.now(), timeoutMs });
     });
   };
 

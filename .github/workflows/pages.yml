@@ -62,16 +62,16 @@ jobs:
       - name: Browser e2e gate (real Chromium against the built dashboard — FAIL-CLOSED)
         # The authoritative gate: the wasm substrate re-derives κ, the shell is hermes-web, and — when a
         # warm κ shipped (E2E_EXPECT_HOLOGRAM=1) — the in-browser backend RESUMES, authenticates, and
-        # renders the REAL dashboard with live backend data. That end-to-end render is the proof of
-        # function; if it fails, the deploy is blocked.
+        # EVERY dashboard feature loads real data over the loopback bridge (features.spec covers all 18
+        # panels; agent-capability covers the contracts). If any feature errors, the deploy is blocked.
         run: |
           if [ -f ../web/dist-pages/holo/warm/manifest.json ]; then
-            echo "warm κ present — requiring the in-browser backend"
+            echo "warm κ present — requiring the in-browser backend + all features"
             export E2E_EXPECT_HOLOGRAM=1
           else
-            echo "no warm κ in this build — hologram backend test will skip"
+            echo "no warm κ in this build — hologram backend tests will skip"
           fi
-          npx playwright test deployment.spec.ts
+          npx playwright test deployment.spec.ts features.spec.ts
         working-directory: e2e
 
       - name: Upload Playwright report on failure

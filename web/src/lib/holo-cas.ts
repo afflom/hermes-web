@@ -129,6 +129,25 @@ function warmUrl(rel: string): string {
   return `${base}holo/warm/${rel}`.replace(/([^:])\/\//g, "$1/");
 }
 
+/** One bank-captured dashboard read: the warm κ's already-computed response (body is lowercase hex). */
+export interface WarmResponse { status: number; ct: string; body: string }
+/**
+ * Load the bank-captured dashboard responses — the k-aligned read seed. The warm κ computed each of these
+ * GETs once at bank time; the browser serves them from this content-addressed artifact so the dashboard
+ * reads the κ instantly instead of re-computing through the interpreter (~2-3 s each, serialized because the
+ * guest serves one loopback connection at a time). Returns null if not published (older κ) — callers fall
+ * back to live round-trips.
+ */
+export async function loadWarmResponses(): Promise<Record<string, WarmResponse> | null> {
+  try {
+    const res = await fetch(warmUrl("warm-responses.json"), { cache: "no-cache" });
+    if (!res.ok) return null;
+    return (await res.json()) as Record<string, WarmResponse>;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Load + verify the warm snapshot. OPFS cache first; otherwise fetch the manifest, fetch each chunk,
  * reassemble, and verify the whole by re-derivation against the substrate κ. Throws if no manifest is

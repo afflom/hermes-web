@@ -11,7 +11,7 @@ export type ToWorker =
   // base = HERMES_BASE_PATH (the worker strips it from guest paths). opfs=true pages the disk into an
   // OPFS κ-store (off the wasm heap, lower memory) — opt-in, since it is currently slower (per-sector
   // OPFS I/O over the ~900 MB disk); the default monolithic resume is faster and proven.
-  | { t: "boot"; base: string; opfs: boolean }
+  | { t: "boot"; base: string; opfs: boolean; diag?: string; egressAvailable?: boolean }
   | { t: "fetch"; rid: number; path: string; method: string; headers: Record<string, string>; body?: string }
   | { t: "wsopen"; sid: number; path: string }
   | { t: "wssend"; sid: number; data: string | ArrayBuffer; binary: boolean }

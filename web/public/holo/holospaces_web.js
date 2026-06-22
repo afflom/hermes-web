@@ -1880,6 +1880,25 @@ export class Workspace {
         }
     }
     /**
+     * (Re)attach the routed `ChannelEgress` so the guest's outbound flows to the page's router (extension
+     * or native gateway). The page calls this once a router is available (at boot if detected, or live
+     * when the operator installs the extension) — no re-resume needed; drive [`egress_outbound`]/
+     * [`egress_inbound`] as before.
+     */
+    set_egress_channel() {
+        wasm.workspace_set_egress_channel(this.__wbg_ptr);
+    }
+    /**
+     * Make the guest's outbound network FAIL FAST (no router peer): reattach a `NoEgress` so any
+     * connect the guest attempts is refused immediately instead of hanging on a dropped frame. The page
+     * calls this when no router extension (or native gateway) is present — otherwise an in-guest
+     * background task that reaches out (the resumed warm machine has several) blocks the asyncio loop
+     * forever, which is what stalls auth. Idempotent.
+     */
+    set_egress_none() {
+        wasm.workspace_set_egress_none(this.__wbg_ptr);
+    }
+    /**
      * Whether the terminal has rendered `marker` yet (e.g. the ready banner).
      * @param {string} marker
      * @returns {boolean}
@@ -1889,6 +1908,26 @@ export class Workspace {
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.workspace_shows(this.__wbg_ptr, ptr0, len0);
         return ret !== 0;
+    }
+    /**
+     * A deterministic fingerprint of the FULL machine state (RAM, registers, devices) — the sha256 of a
+     * fresh snapshot. The emulator is deterministic, so for the same restored machine and the same input
+     * this digest MUST be identical native vs wasm at every instruction checkpoint. A differential test
+     * (`cc_warm_divergence`) compares native and wasm digest sequences; the first mismatch localizes the
+     * wasm-vs-native execution divergence. Uses the same hash as the native witness so values compare.
+     * @returns {string}
+     */
+    state_digest() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.workspace_state_digest(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
     }
     /**
      * The running holospace's κ snapshot — its canonical state (Law L1/L3/L5).
