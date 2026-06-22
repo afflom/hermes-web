@@ -166,13 +166,19 @@ export async function loadWarmSnapshot(kappa: KappaFn, onProgress: OnProgress = 
   const cached = await readCached(manifest, kappa, onProgress);
   if (cached) return cached;
 
-  // Fetch each chunk and concatenate into the full snapshot (pure transport framing).
+  // Fetch each chunk and concatenate into the full snapshot (pure transport framing). Chunk file names are
+  // positional (00000…) and STABLE across deploys, but their contents change whenever the κ is re-banked —
+  // and a re-bank can shift chunk boundaries, so an old cached chunk has the wrong size for the new manifest.
+  // `force-cache` would happily serve that stale chunk → "size mismatch". Version the URL by the κ hash: the
+  // chunks are immutable *per κ* (cache them hard), but a new κ yields new URLs that bypass every stale cache
+  // (browser + Pages/Fastly edge). The manifest itself is always fetched no-cache, so the κ is always current.
+  const ver = (manifest.kappa.match(/[0-9a-f]{8,}/i)?.[0] ?? manifest.kappa).slice(0, 16);
   const snapshot = new Uint8Array(manifest.size);
   let offset = 0;
   for (let i = 0; i < manifest.chunks.length; i++) {
     const c = manifest.chunks[i];
     onProgress({ phase: "chunk", fraction: i / manifest.chunks.length, detail: `fetching warm machine ${i + 1}/${manifest.chunks.length}` });
-    const cr = await fetch(warmUrl(`chunks/${c.name}`), { cache: "force-cache" });
+    const cr = await fetch(`${warmUrl(`chunks/${c.name}`)}?v=${ver}`, { cache: "force-cache" });
     if (!cr.ok) throw new Error(`warm-κ chunk ${c.name} fetch failed (${cr.status})`);
     const bytes = manifest.chunkGzip ? await gunzip(new Uint8Array(await cr.arrayBuffer())) : new Uint8Array(await cr.arrayBuffer());
     if (bytes.length !== c.size) throw new Error(`warm-κ chunk ${c.name} size mismatch`);
