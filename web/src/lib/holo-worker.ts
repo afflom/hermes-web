@@ -10,6 +10,7 @@
 
 import { ungzip } from "pako";
 import { loadWarmChunks, loadWarmResponses, type WarmLoadProgress } from "./holo-cas";
+import { keysToInvalidateOnMutation } from "./holo-cache";
 import { BridgeRuntime, type HoloWorkspace, type RuntimeSocket } from "./holo-runtime";
 import type { EgressChannel } from "./holo-egress";
 import type { ToWorker, FromWorker } from "./holo-protocol";
@@ -178,7 +179,14 @@ function serveGuestFetch(msg: { path: string; method: string; headers: Record<st
   // /api/status: NEVER fetch synchronously — answer from the cached κ; the idle refresher re-derives it.
   if (isGet && bare === STATUS_PATH) return serveStatus();
   if (!isGet) {
-    fetchCache.clear(); // a mutation can change any read
+    // A mutation can change reads — but do NOT wipe the whole κ seed (that knocks the ENTIRE dashboard back
+    // onto the slow single lane after any save/toggle/delete, the dominant flakiness). Drop only the
+    // non-seeded short-TTL entries + the κ-seeded reads under the mutated resource (so the user sees their
+    // own write); unrelated κ reads stay instant. See holo-cache.keysToInvalidateOnMutation.
+    for (const k of keysToInvalidateOnMutation(bare, [...fetchCache.keys()], (key) => seededPaths.has(key))) {
+      fetchCache.delete(k);
+      seededPaths.delete(k); // a fresh re-read now supersedes the stale seed for this resource
+    }
     return runGuestFetch(msg);
   }
   const key = msg.path;

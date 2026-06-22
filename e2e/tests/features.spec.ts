@@ -55,9 +55,19 @@ const FEATURES: Feature[] = [
   { name: "System", label: "System", route: /\/system$/, endpoints: [{ path: "/api/system/stats" }] },
 ];
 
+// Every guest GET the worker actually DIALED (a warm-seed hit is served from RAM and never dialed). After
+// exercising all local tabs this must contain only the legitimately un-seedable paths — otherwise a tab is
+// falling off the k-representation onto the slow single lane (the flakiness this push eliminates).
+const guestGets: string[] = [];
+
 /** Boot the in-browser backend once and adopt the session token (warm-κ resume). */
 async function bootBackend(page: Page): Promise<void> {
-  page.on("console", (m) => record(`[browser:${m.type()}] ${m.text()}`));
+  page.on("console", (m) => {
+    const t = m.text();
+    record(`[browser:${m.type()}] ${t}`);
+    const g = t.match(/→ guest GET (\S+)/);
+    if (g) guestGets.push(g[1]);
+  });
   page.on("pageerror", (e) => record(`[browser:pageerror] ${e.message}`));
   await page.goto("./", { waitUntil: "load" });
 
@@ -163,6 +173,16 @@ test("every hermes-web feature loads real data from the in-browser backend (BDD,
     }
     record(`[features] ${feat.name} UI rendered at ${new URL(page.url()).pathname}${isEgress && !EGRESS ? " (egress — panel-only)" : ""}`);
   }
+
+  // ── k-ALIGNMENT GATE: having opened every local tab, the ONLY guest GETs the worker should have dialed are
+  // the legitimately un-seedable ones — /api/status (live-refreshed, k-aligned), /api/config (the boot's own
+  // health probe), and the egress-gated endpoints (model/skills/mcp/messaging/hermes-update; they fast-503
+  // without the router and are never seeded). Any other path here means a local-read tab fell off the warm
+  // seed onto the slow single lane — the flakiness this must prevent. Fail closed.
+  const allowMiss = /^\/api\/(status\b|config\b|model\/(info|options|set|auxiliary)\b|models\b|skills|mcp\/|mcp\b|messaging\/|hermes\/update)/;
+  const seedMisses = [...new Set(guestGets)].filter((p) => !allowMiss.test(p));
+  record(`[features] k-alignment: ${new Set(guestGets).size} unique guest GETs; off-seed local reads: ${seedMisses.join(", ") || "none"}`);
+  expect(seedMisses, `every local tab must serve from the warm seed, not the slow lane: ${seedMisses.join(", ")}`).toEqual([]);
 
   // ── Tier 3 (egress): the agent chat round-trip — the core hermes-agent experience ──────────────────
   if (EGRESS) {
