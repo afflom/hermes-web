@@ -35,7 +35,7 @@ async function buildCas(snapshot: Uint8Array, chunkSize: number) {
   const fetchImpl = vi.fn(async (url: string) => {
     const u = String(url);
     if (u.endsWith("manifest.json")) return new Response(JSON.stringify(manifest), { status: 200 });
-    const m = u.match(/chunks\/(\d+)$/);
+    const m = u.match(/chunks\/(\d+)(?:\?|$)/); // tolerate the ?v=<κ> cache-bust query (static server ignores it)
     if (m) {
       const gz = gzByName.get(m[1]);
       if (gz) return new Response(gz as BodyInit, { status: 200 });
