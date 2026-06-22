@@ -159,26 +159,43 @@ fn the_hermes_guest_boots_and_serves_the_dashboard_api() {
         warm_t0.elapsed(),
         if token.is_some() { "captured" } else { "NOT found (authed endpoints will only warm middleware)" }
     );
-    // EVERY dashboard endpoint a hermes-agent user loads — so each one's first-call cost is paid into RAM
-    // (warm) AND its on-disk state (/root/.hermes: session DB, config, skills, mcp) is created at bank time
-    // on the now-writable disk. Both 200 and empty-but-200 responses warm the route; we log each timing so
-    // a regression (a still-cold or 500ing endpoint) is visible in the bank log.
-    for path in [
-        "/api/status", "/api/config", "/api/config/schema", "/api/config/defaults",
-        "/api/sessions?limit=20&offset=0&order=created", "/api/dashboard/themes", "/api/dashboard/plugins",
-        "/api/analytics/models", "/api/analytics/usage?days=7", "/api/models", "/api/model/info",
-        "/api/model/options", "/api/env", "/api/cron/jobs", "/api/skills",
-        "/api/profiles", "/api/profiles/active", "/api/webhooks", "/api/pairing", "/api/files",
-        "/api/system/stats", "/api/logs?file=agent&lines=50",
-        // NB: /api/messaging/platforms AND /api/mcp/servers PROBE outbound network. With NoEgress at bank
-        // time they not only hang/500 — they leave a BACKGROUND RECONNECT TASK in the asyncio loop, and the
-        // resumed κ then spins forever on its first request (the loop is monopolized re-trying the dead
-        // peer). They warm in the browser via the router extension on first use — never warm them here.
-    ] {
+    // EVERY dashboard endpoint a hermes-agent user loads — the EXACT [`SAFE_WARM_PATHS`] set (one source of
+    // truth, shared with the seed the browser ships), all LOCAL reads (the network-probing model/skills/mcp/
+    // messaging endpoints are excluded there — under NoEgress they leave a background reconnect task that
+    // spins the resumed κ; they fast-503 in the browser until the router extension is installed). Warming
+    // pays each route's first-call cost into RAM AND creates its on-disk state (/root/.hermes) at bank time;
+    // we ALSO capture each response here, on the live fresh-booted machine, and write it as the warm seed
+    // (warm-responses.json) — so the bank SELF-CAPTURES the seed instead of a fragile separate restore-and-
+    // serve. We log each timing so a regression (a still-cold or 500ing endpoint) is visible in the bank log.
+    let mut seed: Vec<(String, u16, String, Vec<u8>)> = Vec::new();
+    for path in SAFE_WARM_PATHS {
         let t0 = std::time::Instant::now();
-        let r = warm_endpoint(&mut emu, path, token.as_deref());
-        let status = String::from_utf8_lossy(&r[..r.len().min(20)]).replace("HTTP/1.1 ", "");
-        eprintln!("[hermes-guest]   warmed {path}: {} bytes in {:?} [{}]", r.len(), t0.elapsed(), status.trim());
+        let raw = warm_endpoint(&mut emu, path, token.as_deref());
+        let split = raw.windows(4).position(|w| w == b"\r\n\r\n");
+        let (head, body) = match split { Some(i) => (&raw[..i], raw[i + 4..].to_vec()), None => (&raw[..], Vec::new()) };
+        let head_s = String::from_utf8_lossy(head);
+        let mut lines = head_s.split("\r\n");
+        let status: u16 = lines.next().and_then(|l| l.split_whitespace().nth(1)).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let ct = lines.find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
+            .and_then(|l| l.split_once(':')).map(|(_, v)| v.trim().to_owned())
+            .unwrap_or_else(|| "application/json".to_owned());
+        eprintln!("[hermes-guest]   warmed {path}: {} bytes ({status}) in {:?}", body.len(), t0.elapsed());
+        seed.push((path.to_string(), status, ct, body));
+    }
+    // Write the captured seed next to the κ — the chunk step ships it as web/public/holo/warm/warm-responses.json.
+    {
+        let mut out = String::from("{\n");
+        for (i, (p, status, ct, body)) in seed.iter().enumerate() {
+            let hex: String = body.iter().map(|b| format!("{b:02x}")).collect();
+            let comma = if i + 1 < seed.len() { "," } else { "" };
+            out.push_str(&format!("  {p:?}: {{\"status\":{status},\"ct\":{ct:?},\"body\":\"{hex}\"}}{comma}\n"));
+        }
+        out.push_str("}\n");
+        let dest = witness_dir().join("warm-responses.json");
+        match std::fs::write(&dest, &out) {
+            Ok(()) => eprintln!("[hermes-guest] warm seed captured: {} responses ({} bytes) → {dest:?}", seed.len(), out.len()),
+            Err(e) => eprintln!("[hermes-guest] WARN: could not write warm seed: {e}"),
+        }
     }
     // Re-hit `/` and `/api/status` now that everything is hot — proves the warm path is fast (these timings
     // should be a fraction of the first), and ensures the steady-state working set is resident.
@@ -485,7 +502,11 @@ fn cc_capture_responses() {
     let (egress, router) = holospaces::emulator::net::ChannelEgress::new();
     r.reattach_net_egress(Box::new(egress));
     assert!(r.enable_loopback(), "loopback");
-    for _ in 0..40 { r.run(PUMP_BUDGET); while router.pop_outbound().is_some() {} }
+    // SETTLE the resumed server before probing. The warm κ is banked UNSETTLED (net/loop mid-state), so a
+    // resume needs the asyncio loop + uvicorn to re-establish accept() before it answers — the browser gives
+    // it ~28 s (~11e9 guest instr); 40 ticks (320 M) is ~35× too little and leaves "/" never responding, so
+    // warm_endpoint burns its whole budget and the token comes back empty. Match the browser's settle.
+    for _ in 0..2500 { r.run(PUMP_BUDGET); while router.pop_outbound().is_some() {} }
     let index = warm_endpoint(&mut r, "/", None);
     let token = String::from_utf8_lossy(&index).split("window.__HERMES_SESSION_TOKEN__=\"").nth(1)
         .and_then(|s| s.split('"').next()).map(|s| s.to_owned()).unwrap_or_default();
@@ -615,16 +636,25 @@ const SAFE_WARM_PATHS: &[&str] = &[
     // the dashboard mount fires ~10 of these CONCURRENTLY — one cold one stalls all the rest. So warm the
     // whole mount set (incl. auth/me, dashboard/font, sessions/stats, sessions/empty/count) + per-page reads.
     "/api/status", // captured so the browser seeds it (served instantly, refreshed when idle — k-aligned)
-    "/api/auth/me", "/api/config", "/api/config/schema", "/api/config/defaults",
+    "/api/auth/me", "/api/config", "/api/config/schema", "/api/config/defaults", "/api/config/raw",
     "/api/sessions?limit=20&offset=0&order=created", "/api/sessions?limit=50&offset=0&order=created",
     // The Sessions PAGE (not the mount) queries with order=recent + limit=30; the Files page lists /root.
     "/api/sessions?limit=30&offset=0&order=recent", "/api/files?path=%2Froot",
     "/api/sessions/stats", "/api/sessions/empty/count",
-    "/api/dashboard/themes", "/api/dashboard/plugins", "/api/dashboard/font",
-    "/api/analytics/models", "/api/analytics/usage?days=7", "/api/env",
-    "/api/cron/jobs", "/api/cron/delivery-targets", "/api/cron/blueprints",
+    "/api/dashboard/themes", "/api/dashboard/plugins", "/api/dashboard/plugins/hub", "/api/dashboard/font",
+    // Analytics + Logs are QUERY-PARAMETERIZED and the seed matches the FULL path incl. query — so we must
+    // seed the EXACT strings the dashboard sends (its defaults + period selector), or each one MISSES the
+    // seed and pays a ~10 s single-lane guest round-trip. (This was the live "dashboard takes an hour" bug.)
+    "/api/analytics/models", "/api/analytics/models?days=7", "/api/analytics/models?days=30", "/api/analytics/models?days=90",
+    "/api/analytics/usage?days=7", "/api/analytics/usage?days=30", "/api/analytics/usage?days=90",
+    "/api/env",
+    "/api/cron/jobs", "/api/cron/jobs?profile=all", "/api/cron/delivery-targets", "/api/cron/blueprints",
     "/api/profiles", "/api/profiles/active", "/api/webhooks", "/api/pairing", "/api/files",
-    "/api/system/stats", "/api/logs?file=agent&lines=50",
+    // System page reads: every local status endpoint it loads at once (a cold one stalls the whole page).
+    "/api/system/stats", "/api/memory", "/api/credentials/pool",
+    "/api/ops/checkpoints", "/api/ops/hooks", "/api/curator", "/api/portal",
+    "/api/tools/toolsets",
+    "/api/logs?file=agent&lines=50", "/api/logs?file=agent&lines=100",
 ];
 
 /// FAST iteration of the warm list WITHOUT re-booting: resume the COLD κ (banked at READY by the cold-boot

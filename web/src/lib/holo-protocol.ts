@@ -13,6 +13,10 @@ export type ToWorker =
   // OPFS I/O over the ~900 MB disk); the default monolithic resume is faster and proven.
   | { t: "boot"; base: string; opfs: boolean; diag?: string; egressAvailable?: boolean }
   | { t: "fetch"; rid: number; path: string; method: string; headers: Record<string, string>; body?: string }
+  // RAW guest GET that BYPASSES the worker's own handlers (the warm seed, the /api/status k-aligned
+  // short-circuit, and the egress 503 gate) so the seed-capture harness records the guest's TRUE response
+  // for every path. Capture-only; the dashboard never sends this.
+  | { t: "capraw"; rid: number; path: string; headers?: Record<string, string> }
   | { t: "wsopen"; sid: number; path: string }
   | { t: "wssend"; sid: number; data: string | ArrayBuffer; binary: boolean }
   | { t: "wsclose"; sid: number }

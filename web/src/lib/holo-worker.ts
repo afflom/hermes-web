@@ -23,7 +23,29 @@ interface HsModule {
   Workspace: {
     resume_devcontainer_net_bridged: (snapshot: Uint8Array) => HoloWorkspace;
     resume_devcontainer_net_bridged_fed: (next: () => Uint8Array) => HoloWorkspace;
+    resume_devcontainer_net_bridged_fed_opfs: (
+      next: () => Uint8Array,
+      diskHandle: FileSystemSyncAccessHandle,
+    ) => HoloWorkspace;
   };
+}
+
+/** Open a fresh, empty OPFS sync access handle for the off-heap disk κ-store (worker-only API). Each boot
+ * starts from a truncated file so the κ→offset index the store builds matches the bytes on disk. No
+ * fallback: if OPFS sync handles are unavailable we fail loud rather than silently fall back to an in-heap
+ * disk (which is the ~3.3 GB peak we are eliminating). */
+async function openDiskHandle(): Promise<FileSystemSyncAccessHandle> {
+  const root = await navigator.storage.getDirectory();
+  // Drop any stale disk from a previous boot, then create + open fresh.
+  try {
+    await root.removeEntry("hermes-disk.kstore");
+  } catch {
+    /* absent is fine */
+  }
+  const fh = await root.getFileHandle("hermes-disk.kstore", { create: true });
+  const handle = await fh.createSyncAccessHandle();
+  handle.truncate(0); // belt-and-suspenders: the store appends from offset 0
+  return handle;
 }
 
 /** Surface a diagnostic line to the main thread (→ browser console). */
@@ -80,7 +102,10 @@ function seedReadCache(responses: Record<string, { status: number; ct: string; b
 // stuck handler holds the guest's single serving slot — poisoning every later loopback read. So when egress
 // is absent we answer them a fast 503 here, never dialing the guest. With the extension present they pass
 // through normally. (The dashboard treats the 503 as "unavailable" and shows the install nudge.)
-const EGRESS_PROBE = /^\/api\/(model\/(info|options|set|auxiliary)|skills|mcp\/|mcp$|messaging\/)/;
+// `hermes/update` (check + apply) probes GitHub for a newer release — an outbound call with the same
+// single-slot-poisoning hazard, so it fast-503s without the router too (the dashboard shows "update
+// unavailable", correct offline). All other dashboard reads are LOCAL and served instantly from the warm seed.
+const EGRESS_PROBE = /^\/api\/(model\/(info|options|set|auxiliary)|skills|mcp\/|mcp$|messaging\/|hermes\/update)/;
 let egressAvailable = false;
 const egressUnavailableRes = (): Promise<CachedRes> =>
   Promise.resolve({ status: 503, statusText: "router extension required", headers: [["content-type", "application/json"]],
@@ -219,6 +244,10 @@ async function boot(_useOpfs: boolean, diagMode?: string, egressIsAvailable = fa
   // (live JS bytes + wasm memory) on each window so the true peak is measured and gated (deployment.spec).
   report({ phase: "resume", detail: "resuming the warm machine (no cold boot)" });
   const tResume = performance.now();
+  // Open the off-heap disk κ-store BEFORE feeding: the disk's content-addressed sectors page into OPFS as
+  // the snapshot streams, so they never land on the wasm heap. Combined with the SPARSE κ (no dense zero
+  // free-space), the wasm heap holds only RAM + the sparse indices → resume peaks well under 1.5 GB.
+  const diskHandle = await openDiskHandle();
   let ws: HoloWorkspace;
   const FEED = 16 * 1024 * 1024;
   let ci = 0;
@@ -251,7 +280,7 @@ async function boot(_useOpfs: boolean, diagMode?: string, egressIsAvailable = fa
     sample();
     return win;
   };
-  ws = hs.Workspace.resume_devcontainer_net_bridged_fed(next);
+  ws = hs.Workspace.resume_devcontainer_net_bridged_fed_opfs(next, diskHandle);
   for (let i = 0; i < gz.length; i++) gz[i] = null; // ensure everything is freed
   log("info", `resumed (streamed-fed) in ${since(tResume)}, peak ${(peakBytes / 1e6).toFixed(0)} MB`);
   post({ t: "peakbytes", bytes: peakBytes });
@@ -390,6 +419,18 @@ ctx.onmessage = (ev: MessageEvent<ToWorker>) => {
           const ms = performance.now() - t0;
           if (ms > 1500) log("info", `${msg.method} ${msg.path} → ${r.status} (${(ms / 1000).toFixed(1)}s)`);
           const body = r.body.slice(0); // a transferable copy; the cache keeps the original
+          post({ t: "fetchres", rid: msg.rid, status: r.status, statusText: r.statusText, headers: r.headers, body }, [body]);
+        })
+        .catch((e) => post({ t: "fetcherr", rid: msg.rid, message: e instanceof Error ? e.message : String(e) }));
+      break;
+    }
+    case "capraw": {
+      // Seed-capture only: dial the guest DIRECTLY (bypass the seed, the /api/status short-circuit, and the
+      // egress gate) so we record the guest's true response (e.g. /api/status → 200, not the uncached 503).
+      if (!runtime) return post({ t: "fetcherr", rid: msg.rid, message: "runtime not ready" });
+      runGuestFetch({ path: msg.path, method: "GET", headers: msg.headers ?? {}, timeoutMs: 240_000 })
+        .then((r) => {
+          const body = r.body.slice(0);
           post({ t: "fetchres", rid: msg.rid, status: r.status, statusText: r.statusText, headers: r.headers, body }, [body]);
         })
         .catch((e) => post({ t: "fetcherr", rid: msg.rid, message: e instanceof Error ? e.message : String(e) }));

@@ -1800,6 +1800,26 @@ export class Workspace {
         return Workspace.__wrap(ret[0]);
     }
     /**
+     * Resume by **feeding the κ-snapshot from JS memory in chunks** (like
+     * [`resume_devcontainer_net_bridged_fed`](Workspace::resume_devcontainer_net_bridged_fed)) BUT
+     * page the guest disk into an **OPFS κ-store** instead of the wasm heap. This is the substrate-correct
+     * production path for the SPARSE κ: the snapshot streams from RAM (no OPFS staging → no quota pressure
+     * from the ~1.3 GB snapshot), and the disk's content-addressed sectors (~675 MB across ~1.4 M small
+     * blobs) land in OPFS, off the wasm heap — only RAM + the sparse disk index + the κ→offset index stay
+     * resident, so the resume peaks well under 1.5 GB (vs ~3.3 GB with the disk in heap). `disk_handle` is
+     * a fresh OPFS `FileSystemSyncAccessHandle`. Egress + loopback are re-attached as the monolithic path.
+     * @param {Function} next
+     * @param {FileSystemSyncAccessHandle} disk_handle
+     * @returns {Workspace}
+     */
+    static resume_devcontainer_net_bridged_fed_opfs(next, disk_handle) {
+        const ret = wasm.workspace_resume_devcontainer_net_bridged_fed_opfs(next, disk_handle);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return Workspace.__wrap(ret[0]);
+    }
+    /**
      * Resume like [`resume_devcontainer_net_bridged`](Workspace::resume_devcontainer_net_bridged), but
      * **stream the κ-snapshot from an OPFS file and page the guest disk into an OPFS κ-store** — so the
      * multi-hundred-MB disk NEVER lands on the wasm heap. Only RAM + the sparse disk index stay
@@ -2508,7 +2528,7 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 13, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h091698db9a8be138);
             return ret;
         },
@@ -2518,17 +2538,17 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 13, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h091698db9a8be138_2);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 13, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h091698db9a8be138_3);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 13, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h091698db9a8be138_4);
             return ret;
         },

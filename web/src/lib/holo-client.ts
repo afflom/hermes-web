@@ -152,6 +152,15 @@ export async function bootWorkerTransport(report: (p: HologramBootProgress) => v
           if (!headers.has("authorization")) headers.set("authorization", `Bearer ${token}`);
           return workerFetch(path, { ...init, headers });
         };
+        // Seed-capture hook: a RAW guest GET that bypasses the worker's seed/status/egress handlers, so the
+        // capture e2e records the guest's true response per path. Returns a real Response (capture-only).
+        w.__HOLO_CAPTURE__ = (path: string): Promise<Response> => {
+          const rid = nextRid++;
+          return new Promise<Response>((resolve, reject) => {
+            pendingFetch.set(rid, { resolve, reject });
+            send({ t: "capraw", rid, path, headers: { authorization: `Bearer ${token}` } });
+          });
+        };
         w.__HOLO_WS__ = (path: string) => {
           const sep = path.includes("?") ? "&" : "?";
           return new WorkerSocket(guestRelativePath(`${path}${sep}token=${encodeURIComponent(token)}`, HERMES_BASE_PATH));

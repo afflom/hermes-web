@@ -81,7 +81,7 @@ index 8ca6d25..038ba0f 100644
  name = "proc-macro2"
  version = "1.0.106"
 diff --git a/crates/holospaces-web/src/lib.rs b/crates/holospaces-web/src/lib.rs
-index bed80bd..bc1a6eb 100644
+index bed80bd..9836b7a 100644
 --- a/crates/holospaces-web/src/lib.rs
 +++ b/crates/holospaces-web/src/lib.rs
 @@ -47,7 +47,152 @@ use holospaces::assembly::{assemble_ext4, assemble_ext4_bootable, Layer};
@@ -284,7 +284,34 @@ index bed80bd..bc1a6eb 100644
      /// Drain the next egress frame the guest produced, for the page to carry to
      /// the router. `undefined` when none is queued (or this is not a routed boot).
      #[must_use]
-@@ -1389,6 +1573,142 @@ impl Workspace {
+@@ -1351,6 +1535,26 @@ impl Workspace {
+             .and_then(net::RouterChannel::pop_outbound)
+     }
+ 
++    /// Make the guest's outbound network FAIL FAST (no router peer): reattach a `NoEgress` so any
++    /// connect the guest attempts is refused immediately instead of hanging on a dropped frame. The page
++    /// calls this when no router extension (or native gateway) is present — otherwise an in-guest
++    /// background task that reaches out (the resumed warm machine has several) blocks the asyncio loop
++    /// forever, which is what stalls auth. Idempotent.
++    pub fn set_egress_none(&mut self) {
++        self.machine.reattach_net_egress(Box::new(net::NoEgress));
++        self.router = None;
++    }
++
++    /// (Re)attach the routed `ChannelEgress` so the guest's outbound flows to the page's router (extension
++    /// or native gateway). The page calls this once a router is available (at boot if detected, or live
++    /// when the operator installs the extension) — no re-resume needed; drive [`egress_outbound`]/
++    /// [`egress_inbound`] as before.
++    pub fn set_egress_channel(&mut self) {
++        let (egress, router) = net::ChannelEgress::new();
++        self.machine.reattach_net_egress(Box::new(egress));
++        self.router = Some(router);
++    }
++
+     /// Deliver an egress frame the router returned (the host's bytes / connection
+     /// events) into the guest's network. A no-op when this is not a routed boot.
+     pub fn egress_inbound(&self, frame: &[u8]) {
+@@ -1389,6 +1593,172 @@ impl Workspace {
          })
      }
  
@@ -424,17 +451,180 @@ index bed80bd..bc1a6eb 100644
 +        })
 +    }
 +
++    /// Resume by **feeding the κ-snapshot from JS memory in chunks** (like
++    /// [`resume_devcontainer_net_bridged_fed`](Workspace::resume_devcontainer_net_bridged_fed)) BUT
++    /// page the guest disk into an **OPFS κ-store** instead of the wasm heap. This is the substrate-correct
++    /// production path for the SPARSE κ: the snapshot streams from RAM (no OPFS staging → no quota pressure
++    /// from the ~1.3 GB snapshot), and the disk's content-addressed sectors (~675 MB across ~1.4 M small
++    /// blobs) land in OPFS, off the wasm heap — only RAM + the sparse disk index + the κ→offset index stay
++    /// resident, so the resume peaks well under 1.5 GB (vs ~3.3 GB with the disk in heap). `disk_handle` is
++    /// a fresh OPFS `FileSystemSyncAccessHandle`. Egress + loopback are re-attached as the monolithic path.
++    pub fn resume_devcontainer_net_bridged_fed_opfs(
++        next: js_sys::Function,
++        disk_handle: web_sys::FileSystemSyncAccessHandle,
++    ) -> Result<Workspace, JsValue> {
++        let base = MachineSpec::devcontainer().base;
++        let mut reader = FedReader::new(next);
++        let disk_store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
++        let mut machine = Emulator::restore_net_streamed(base, &mut reader, disk_store).map_err(js_err)?;
++        let (egress, router) = net::ChannelEgress::new();
++        machine.reattach_net_egress(Box::new(egress));
++        machine.enable_loopback();
++        Ok(Workspace {
++            machine,
++            store: MemKappaStore::new(),
++            channel: Vec::new(),
++            files: std::collections::BTreeMap::new(),
++            halted: false,
++            console_cursor: 0,
++            router: Some(router),
++        })
++    }
++
      /// Advance the running holospace by `budget` instructions (one chunk of the
      /// boot or of servicing input). Returns `true` once the machine has halted
      /// (powered off). Call repeatedly from a UI loop, rendering
-diff --git a/crates/holospaces/src/emulator.rs b/crates/holospaces/src/emulator.rs
-index 876b044..86f4a40 100644
---- a/crates/holospaces/src/emulator.rs
-+++ b/crates/holospaces/src/emulator.rs
-@@ -597,6 +597,46 @@ impl<'a> SnapshotReader<'a> {
+@@ -1403,6 +1773,16 @@ impl Workspace {
+         self.halted
      }
+ 
++    /// A deterministic fingerprint of the FULL machine state (RAM, registers, devices) — the sha256 of a
++    /// fresh snapshot. The emulator is deterministic, so for the same restored machine and the same input
++    /// this digest MUST be identical native vs wasm at every instruction checkpoint. A differential test
++    /// (`cc_warm_divergence`) compares native and wasm digest sequences; the first mismatch localizes the
++    /// wasm-vs-native execution divergence. Uses the same hash as the native witness so values compare.
++    #[must_use]
++    pub fn state_digest(&self) -> String {
++        self.machine.live_digest()
++    }
++
+     /// Whether the machine has powered off.
+     #[wasm_bindgen(getter)]
+     #[must_use]
+diff --git a/crates/holospaces-web/src/opfs_store.rs b/crates/holospaces-web/src/opfs_store.rs
+index a051ac7..50052db 100644
+--- a/crates/holospaces-web/src/opfs_store.rs
++++ b/crates/holospaces-web/src/opfs_store.rs
+@@ -20,12 +20,25 @@ use hologram_substrate_core::{
+ };
+ use web_sys::{FileSystemReadWriteOptions, FileSystemSyncAccessHandle};
+ 
++/// How many bytes to accumulate in the write-back buffer before flushing to OPFS.
++/// One `write_with_u8_array_and_options` per 512-byte sector is catastrophic (the
++/// warm disk is ~1.4 M sectors → ~1.4 M sync writes, a multi-minute resume). We
++/// instead append into RAM and flush in ~8 MiB blocks, cutting the OPFS syscall
++/// count ~16000× (≈85 writes for the whole disk) while keeping only ≤8 MiB resident.
++const WRITE_BUF_FLUSH: usize = 8 * 1024 * 1024;
++
+ /// A content-addressed store whose blobs live in an OPFS pack file (off the wasm
+-/// heap), addressed by an in-RAM offset index.
++/// heap), addressed by an in-RAM offset index. Appends are buffered in RAM and
++/// flushed in large blocks (see [`WRITE_BUF_FLUSH`]) so paging the warm disk in is
++/// a few dozen OPFS writes, not one per sector.
+ pub struct OpfsKappaStore {
+     handle: FileSystemSyncAccessHandle,
+     index: RefCell<BTreeMap<[u8; 71], (f64, usize)>>,
++    /// Logical end of the pack (file bytes already flushed + bytes still buffered).
+     append_at: RefCell<f64>,
++    /// Pending appends not yet written to OPFS, and the file offset they start at.
++    write_buf: RefCell<Vec<u8>>,
++    buf_base: RefCell<f64>,
  }
  
+ // The browser peer is single-threaded (wasm has no threads), and the sync access
+@@ -42,6 +55,8 @@ impl OpfsKappaStore {
+             handle,
+             index: RefCell::new(BTreeMap::new()),
+             append_at: RefCell::new(0.0),
++            write_buf: RefCell::new(Vec::new()),
++            buf_base: RefCell::new(0.0),
+         }
+     }
+ 
+@@ -49,6 +64,29 @@ impl OpfsKappaStore {
+         let label = address_bytes_axis(axis, bytes).map_err(|_| StoreError::UnknownAxis)?;
+         <[u8; 71]>::try_from(label.as_slice()).map_err(|_| StoreError::UnknownAxis)
+     }
++
++    /// Write the buffered appends to OPFS in one syscall and advance the flushed
++    /// base. A blob is never split across a flush boundary (we flush only between
++    /// whole puts), so a κ's bytes are wholly in the file or wholly in the buffer.
++    fn flush(&self) -> Result<(), StoreError> {
++        let mut buf = self.write_buf.borrow_mut();
++        if buf.is_empty() {
++            return Ok(());
++        }
++        let at = *self.buf_base.borrow();
++        let opts = FileSystemReadWriteOptions::new();
++        opts.set_at(at);
++        let wrote = self
++            .handle
++            .write_with_u8_array_and_options(&buf, &opts)
++            .map_err(|_| StoreError::BackendFailure("opfs write"))?;
++        if wrote as usize != buf.len() {
++            return Err(StoreError::BackendFailure("opfs short write"));
++        }
++        *self.buf_base.borrow_mut() = at + buf.len() as f64;
++        buf.clear();
++        Ok(())
++    }
+ }
+ 
+ impl KappaStore for OpfsKappaStore {
+@@ -57,18 +95,14 @@ impl KappaStore for OpfsKappaStore {
+         let kappa = KappaLabel::from_bytes(&arr).map_err(|_| StoreError::InvalidKappa)?;
+         // Idempotent: an already-held κ is not rewritten (dedup, Law L3).
+         if !self.index.borrow().contains_key(&arr) {
++            // Append into the RAM write-back buffer (flushed to OPFS in large blocks).
+             let at = *self.append_at.borrow();
+-            let opts = FileSystemReadWriteOptions::new();
+-            opts.set_at(at);
+-            let wrote = self
+-                .handle
+-                .write_with_u8_array_and_options(bytes, &opts)
+-                .map_err(|_| StoreError::BackendFailure("opfs write"))?;
+-            if wrote as usize != bytes.len() {
+-                return Err(StoreError::BackendFailure("opfs short write"));
+-            }
++            self.write_buf.borrow_mut().extend_from_slice(bytes);
+             self.index.borrow_mut().insert(arr, (at, bytes.len()));
+             *self.append_at.borrow_mut() = at + bytes.len() as f64;
++            if self.write_buf.borrow().len() >= WRITE_BUF_FLUSH {
++                self.flush()?;
++            }
+         }
+         Ok(kappa)
+     }
+@@ -78,6 +112,17 @@ impl KappaStore for OpfsKappaStore {
+             Some(&v) => v,
+             None => return Ok(None),
+         };
++        // A κ still in the unflushed buffer (at >= buf_base) is served from RAM; an
++        // already-flushed one is read from OPFS. A blob never straddles the boundary.
++        let buf_base = *self.buf_base.borrow();
++        if at >= buf_base {
++            let off = (at - buf_base) as usize;
++            let wb = self.write_buf.borrow();
++            if off + len > wb.len() {
++                return Err(StoreError::BackendFailure("opfs buffer underrun"));
++            }
++            return Ok(Some(Bytes::from(wb[off..off + len].to_vec())));
++        }
+         let mut buf = vec![0u8; len];
+         let opts = FileSystemReadWriteOptions::new();
+         opts.set_at(at);
+diff --git a/crates/holospaces/src/emulator.rs b/crates/holospaces/src/emulator.rs
+index 876b044..ef6bd21 100644
+--- a/crates/holospaces/src/emulator.rs
++++ b/crates/holospaces/src/emulator.rs
+@@ -592,8 +592,45 @@ impl<'a> SnapshotReader<'a> {
+     fn bytes(&mut self, n: usize) -> Result<&'a [u8], SnapshotError> {
+         self.take(n)
+     }
+-    fn rest(&self) -> &'a [u8] {
+-        &self.bytes[self.pos..]
++}
++
 +/// A sequential byte source for **streaming restore** ([`Emulator::restore_net_streamed`]) — a slice
 +/// cursor natively/in tests, an OPFS file handle in the browser peer. It lets a resumed machine read its
 +/// κ-snapshot WITHOUT ever holding the whole 1.44 GB in the wasm heap: the big disk section streams
@@ -472,13 +662,84 @@ index 876b044..86f4a40 100644
 +        let v = self.bytes[self.pos..].to_vec();
 +        self.pos = self.bytes.len();
 +        Ok(v)
-+    }
-+}
+     }
+ }
+ 
+@@ -884,6 +921,73 @@ impl KappaBacking {
+         }
+         image
+     }
 +
- /// The RISC-V **PLIC** — priority per source, a pending latch, per-context
- /// enable bits and a priority threshold, and the claim/complete handshake
- /// (RISC-V PLIC spec). Only the sources holospaces wires (the VirtIO IRQ) are
-@@ -2129,6 +2169,24 @@ impl Emulator {
++    /// Serialize the disk as the κ-store's own **SPARSE** content-addressed form
++    /// (Law L3) — the substrate's shape, not a dense image. The store already
++    /// dedups identical sectors and drops all-zero free-space (`None`), so we emit
++    /// each DISTINCT non-zero sector's 512 bytes exactly once (first-appearance
++    /// order) followed by one `u32` slot per sector (`0` = sparse/zero, else the
++    /// 1-based id of its unique content). A dense ~1.9 GB image — most of it ext4
++    /// zero free-space — collapses to just the live, deduped content + a compact
++    /// slot index. Deterministic: the slot order follows `self.index`, so the
++    /// snapshot κ is reproducible (Law L1) and a restore re-derives the same bytes.
++    fn snapshot_sparse_into(&self, out: &mut Vec<u8>) {
++        let sector_count = self.index.len();
++        out.extend_from_slice(&(sector_count as u64).to_le_bytes());
++        // Assign each distinct sector-κ a 1-based slot in first-appearance order.
++        let mut slot_of: BTreeMap<KappaLabel71, u32> = BTreeMap::new();
++        let mut uniques: Vec<KappaLabel71> = Vec::new();
++        let mut slots: Vec<u32> = Vec::with_capacity(sector_count);
++        for entry in &self.index {
++            match entry {
++                None => slots.push(0),
++                Some(k) => {
++                    let id = *slot_of.entry(*k).or_insert_with(|| {
++                        uniques.push(*k);
++                        uniques.len() as u32
++                    });
++                    slots.push(id);
++                }
++            }
++        }
++        out.extend_from_slice(&(uniques.len() as u64).to_le_bytes());
++        for k in &uniques {
++            let bytes = self
++                .store
++                .get(k)
++                .ok()
++                .flatten()
++                .expect("κ-disk: a unique sector's content resolves for its κ");
++            out.extend_from_slice(bytes.as_ref());
++        }
++        for s in &slots {
++            out.extend_from_slice(&s.to_le_bytes());
++        }
++    }
++
++    /// Reassemble a κ-disk from the SPARSE form's already-parsed pieces over a
++    /// caller-supplied store: `uniques` are the distinct non-zero sector κs (each
++    /// content-addressed into `store` by the caller, so they live off-heap when the
++    /// store is OPFS-backed), and `slots` maps every sector to `None` (slot `0`) or
++    /// `uniques[slot-1]`. The inverse of [`Self::snapshot_sparse_into`].
++    fn from_sparse(
++        store: Box<dyn KappaStore>,
++        uniques: &[KappaLabel71],
++        slots: &[u32],
++    ) -> Result<Self, SnapshotError> {
++        let mut index = Vec::with_capacity(slots.len());
++        for &s in slots {
++            index.push(match s {
++                0 => None,
++                _ => Some(*uniques.get((s - 1) as usize).ok_or(SnapshotError::Malformed)?),
++            });
++        }
++        Ok(KappaBacking {
++            store,
++            index,
++            read_cache: core::cell::RefCell::new(SectorCache::new()),
++        })
++    }
+ }
+ 
+ /// The VirtIO **block device** over the **virtio-mmio** transport (modern /
+@@ -2129,6 +2233,24 @@ impl Emulator {
          self.virtionet = Some(VirtioNet::new(egress, Box::new(net::NoIngress)));
      }
  
@@ -503,7 +764,61 @@ index 876b044..86f4a40 100644
      /// Attach the network device with both an `egress` (outbound) and an
      /// `ingress` (forwarded-port inbound) transport (`CC-16` + `CC-21`). A server
      /// the devcontainer runs on a forwarded port is then reachable from outside
-@@ -2679,10 +2737,36 @@ impl Emulator {
+@@ -2579,6 +2701,36 @@ impl Emulator {
+     /// A reproducible snapshot of machine state — registers, PC, and RAM — the
+     /// canonical bytes the substrate κ-addresses on suspend (`CC-9`). Identical
+     /// runs produce identical snapshots (Law L1).
++    /// A memory-light deterministic fingerprint of the machine's LIVE execution state — RAM hashed in
++    /// place (no 512 MB copy) folded with the registers, CSRs, and CLINT. Unlike [`snapshot`](Self::snapshot)
++    /// it never materializes the full ~1.4 GB κ (which doubles the wasm heap and traps on wasm32), and it
++    /// omits the read-mostly disk store. For the same restored machine + same input + same per-step budget
++    /// this digest MUST be identical native vs wasm at every instruction checkpoint; the first checkpoint
++    /// whose digest differs localizes a native↔wasm divergence (the differential-equivalence harness). The
++    /// VirtIO queue indices live in guest RAM, so the loopback request delivery is captured too.
++    #[must_use]
++    pub fn live_digest(&self) -> String {
++        let ram_h = crate::oci::sha256_digest(&self.ram); // 512 MB hashed in place → short label
++        let mut buf = ram_h.into_bytes();
++        buf.extend_from_slice(&self.hart.pc.to_le_bytes());
++        for r in &self.hart.x {
++            buf.extend_from_slice(&r.to_le_bytes());
++        }
++        for r in &self.hart.f {
++            buf.extend_from_slice(&r.to_le_bytes());
++        }
++        for (csr, value) in self.csrs.iter() {
++            buf.extend_from_slice(&csr.to_le_bytes());
++            buf.extend_from_slice(&value.to_le_bytes());
++        }
++        buf.push(self.priv_level);
++        buf.push(u8::from(self.msip));
++        buf.extend_from_slice(&self.reservation.unwrap_or(u64::MAX).to_le_bytes());
++        buf.extend_from_slice(&self.mtime.to_le_bytes());
++        buf.extend_from_slice(&self.mtimecmp.to_le_bytes());
++        crate::oci::sha256_digest(&buf)
++    }
++
+     #[must_use]
+     pub fn snapshot(&self) -> Vec<u8> {
+         let mut out = Vec::with_capacity(8 * 33 + self.ram.len());
+@@ -2642,11 +2794,11 @@ impl Emulator {
+                 out.extend_from_slice(&dev.last_avail.to_le_bytes());
+                 out.extend_from_slice(&dev.interrupt_status.to_le_bytes());
+                 out.push(u8::from(dev.irq_pending));
+-                // The disk content (reconstructed from the κ-disk) — a self-
+-                // contained snapshot so resume is faithful on any peer.
+-                let image = dev.disk.to_image();
+-                out.extend_from_slice(&(image.len() as u64).to_le_bytes());
+-                out.extend_from_slice(&image);
++                // The disk content as the κ-store's own SPARSE form (Law L3): each
++                // distinct non-zero sector once + a per-sector slot index (0 =
++                // sparse/zero), never a dense zero-filled image. This is the
++                // substrate's canonical disk encoding — the ONE snapshot format.
++                dev.disk.snapshot_sparse_into(&mut out);
+             }
+         }
+         // The VirtIO 9P device: its transport state, the fid table, the mount
+@@ -2679,10 +2831,39 @@ impl Emulator {
                  dev.fs.snapshot_into(&mut out);
              }
          }
@@ -541,13 +856,45 @@ index 876b044..86f4a40 100644
 +                out.extend_from_slice(&dev.interrupt_status.to_le_bytes());
 +            }
 +        }
++        // RAM, length-prefixed so restore reads it into an exactly-sized buffer (no
++        // doubling realloc — the transient that otherwise dominates the resume peak).
++        out.extend_from_slice(&(self.ram.len() as u64).to_le_bytes());
          out.extend_from_slice(&self.ram);
          out
      }
-@@ -2817,10 +2901,210 @@ impl Emulator {
+@@ -2751,10 +2932,23 @@ impl Emulator {
+                 let last_avail = r.u16()?;
+                 let interrupt_status = r.u32()?;
+                 let irq_pending = r.u8()? != 0;
+-                let disk_len = r.u64()? as usize;
+-                // Rebuild the κ-disk by content-addressing the snapshot image back
+-                // into a fresh store (the substrate; Law L3).
+-                let disk = KappaBacking::from_image(r.bytes(disk_len)?);
++                // Rebuild the κ-disk from the SPARSE snapshot form by content-
++                // addressing each distinct sector back into a fresh store (Law L3).
++                let sector_count = r.u64()? as usize;
++                let unique_count = r.u64()? as usize;
++                let store: Box<dyn KappaStore> = Box::new(MemKappaStore::new());
++                let mut uniques: Vec<KappaLabel71> = Vec::with_capacity(unique_count);
++                for _ in 0..unique_count {
++                    let k = store
++                        .put("blake3", r.bytes(DISK_SECTOR)?)
++                        .map_err(|_| SnapshotError::Malformed)?;
++                    uniques.push(k);
++                }
++                let mut slots: Vec<u32> = Vec::with_capacity(sector_count);
++                for _ in 0..sector_count {
++                    slots.push(r.u32()?);
++                }
++                let disk = KappaBacking::from_sparse(store, &uniques, &slots)?;
+                 Some(VirtioBlk {
+                     disk,
+                     status,
+@@ -2817,7 +3011,218 @@ impl Emulator {
                  })
              }
          };
+-        emu.ram = r.rest().to_vec();
 +        // VirtIO-net device config (the queue state the guest negotiated). Rebuilt with no-op
 +        // transports; the resume path re-attaches the live egress + loopback ingress (config preserved).
 +        emu.virtionet = match r.u8()? {
@@ -594,10 +941,11 @@ index 876b044..86f4a40 100644
 +                Some(net)
 +            }
 +        };
-         emu.ram = r.rest().to_vec();
-         Ok(emu)
-     }
- 
++        let ram_len = r.u64()? as usize;
++        emu.ram = r.bytes(ram_len)?.to_vec();
++        Ok(emu)
++    }
++
 +    fn sr_u8<R: StreamRead>(r: &mut R) -> Result<u8, SnapshotError> { let mut b = [0u8; 1]; r.read_exact(&mut b)?; Ok(b[0]) }
 +    fn sr_u16<R: StreamRead>(r: &mut R) -> Result<u16, SnapshotError> { let mut b = [0u8; 2]; r.read_exact(&mut b)?; Ok(u16::from_le_bytes(b)) }
 +    fn sr_u32<R: StreamRead>(r: &mut R) -> Result<u32, SnapshotError> { let mut b = [0u8; 4]; r.read_exact(&mut b)?; Ok(u32::from_le_bytes(b)) }
@@ -666,21 +1014,28 @@ index 876b044..86f4a40 100644
 +                let last_avail = Self::sr_u16(r)?;
 +                let interrupt_status = Self::sr_u32(r)?;
 +                let irq_pending = Self::sr_u8(r)? != 0;
-+                let disk_len = Self::sr_u64(r)? as usize;
-+                // Stream the disk image sector-by-sector into the (OPFS-backed) store — never resident.
-+                let sector_count = disk_len.div_ceil(DISK_SECTOR) as u64;
-+                let mut remaining = disk_len;
-+                let mut read_err: Result<(), SnapshotError> = Ok(());
-+                let disk = KappaBacking::from_sectors(disk_store, sector_count, |_i, buf| {
-+                    let n = remaining.min(DISK_SECTOR);
-+                    if read_err.is_ok() {
-+                        if let Err(e) = r.read_exact(&mut buf[..n]) {
-+                            read_err = Err(e);
-+                        }
-+                    }
-+                    remaining -= n;
-+                });
-+                read_err?;
++                // SPARSE κ-store form: stream each DISTINCT non-zero sector into the
++                // (OPFS-backed) store — never all resident — then map the slot index.
++                let sector_count = Self::sr_u64(r)? as usize;
++                let unique_count = Self::sr_u64(r)? as usize;
++                let mut uniques: Vec<KappaLabel71> = Vec::with_capacity(unique_count);
++                let mut sector = [0u8; DISK_SECTOR];
++                for _ in 0..unique_count {
++                    r.read_exact(&mut sector)?;
++                    let k = disk_store
++                        .put("blake3", &sector)
++                        .map_err(|_| SnapshotError::Malformed)?;
++                    uniques.push(k);
++                }
++                // The per-sector slot index, read in one bulk pass (4 B each).
++                let mut sb = vec![0u8; sector_count * 4];
++                r.read_exact(&mut sb)?;
++                let mut slots: Vec<u32> = Vec::with_capacity(sector_count);
++                for i in 0..sector_count {
++                    let o = i * 4;
++                    slots.push(u32::from_le_bytes([sb[o], sb[o + 1], sb[o + 2], sb[o + 3]]));
++                }
++                let disk = KappaBacking::from_sparse(disk_store, &uniques, &slots)?;
 +                Some(VirtioBlk {
 +                    disk,
 +                    status,
@@ -748,14 +1103,14 @@ index 876b044..86f4a40 100644
 +                Some(net)
 +            }
 +        };
-+        emu.ram = r.read_to_end()?;
-+        Ok(emu)
-+    }
-+
-     /// Run until the guest exits, traps, or `max_steps` is reached.
-     pub fn run(&mut self, max_steps: u64) -> Halt {
-         for _ in 0..max_steps {
-@@ -3118,6 +3402,31 @@ impl Emulator {
++        let ram_len = Self::sr_u64(r)? as usize;
++        let mut ram = vec![0u8; ram_len];
++        r.read_exact(&mut ram)?;
++        emu.ram = ram;
+         Ok(emu)
+     }
+ 
+@@ -3118,6 +3523,31 @@ impl Emulator {
      /// any pending receive frames into the guest's receive queue. Called
      /// periodically from the run loop (so host data arrives without the guest
      /// having to transmit first). Delegates to the shared [`devbus`].

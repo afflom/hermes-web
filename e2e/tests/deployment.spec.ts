@@ -78,7 +78,17 @@ test("the in-browser holospaces backend resumes, authenticates, and renders the 
   // peak instead of ~3.3 GB).
   // Surface the in-browser boot to the CI log — the worker relays [holo]/[hermes] boot timings + errors;
   // if READY never arrives we can see exactly where it stalled (resume vs auth) instead of a blind timeout.
-  page.on("console", (m) => recordConsole(`[browser:${m.type()}] ${m.text()}`));
+  // Collect every guest GET the worker actually dialed. The worker logs "→ guest GET <path>" ONLY on a warm-
+  // seed MISS (a hit is served from RAM, never dialed) — so this set IS the dashboard's slow-path reads. A
+  // local read that misses the seed round-trips the single guest lane (~10 s) and is the "dashboard takes an
+  // hour" regression; we assert below that the only misses are the legitimately un-seedable ones.
+  const guestGets: string[] = [];
+  page.on("console", (m) => {
+    const t = m.text();
+    recordConsole(`[browser:${m.type()}] ${t}`);
+    const g = t.match(/→ guest GET (\S+)/);
+    if (g) guestGets.push(g[1]);
+  });
   page.on("pageerror", (e) => recordConsole(`[browser:pageerror] ${e.message}`));
   await page.goto("./", { waitUntil: "load" });
 
@@ -104,7 +114,9 @@ test("the in-browser holospaces backend resumes, authenticates, and renders the 
   // Poll the on-window boot beacons (phase/detail/elapsed) every 3 s so a stall is fully diagnosed — we
   // see exactly which phase froze (resume vs token/auth) and the worker's pump metrics — instead of a
   // blind waitForFunction timeout. page.evaluate is reliable even when page.on("console") drops worker logs.
-  const DEADLINE = Date.now() + 260_000; // streaming low-mem load (JS blake3 + decompress) is slower but bounded
+  const DEADLINE = Date.now() + 330_000; // streaming low-mem load (JS blake3 + decompress) + OPFS disk paging
+  // + the unsettled-κ resume settle: measured ~256 s to READY locally, so 330 s gives margin without masking a
+  // real hang (the per-phase beacon below still localizes any stall).
   let ready = false;
   let lastBeacon = "";
   while (Date.now() < DEADLINE) {
@@ -138,9 +150,11 @@ test("the in-browser holospaces backend resumes, authenticates, and renders the 
   const peakBytes = await page.evaluate(() => (window as unknown as { __HOLO_PEAK_BYTES__?: number }).__HOLO_PEAK_BYTES__);
   expect(typeof peakBytes === "number" && peakBytes > 0, "boot peak-memory beacon present").toBe(true);
   recordConsole(`[boot] peak memory (JS+wasm) = ${((peakBytes as number) / 1e6).toFixed(0)} MB`);
-  const PEAK_BUDGET = 2_500_000_000; // 2.5 GB — above the ~2.3 GB streamed floor (wasm machine + transient),
-  // far below the ~3.3-3.8 GB peak of the old path that OOM-crashed memory-limited tabs. Catches a regression
-  // to materializing the whole snapshot (held buffer or wasm κ-verify copy).
+  const PEAK_BUDGET = 1_600_000_000; // 1.6 GB — above the ~1.22 GB measured floor of the substrate-correct
+  // path (UNIFIED sparse κ + disk paged OFF-heap to an OPFS κ-store + length-prefixed RAM read into an exact
+  // buffer), with headroom for variance. Far below the ~2.3 GB of the old in-heap-disk path and the ~3.3 GB
+  // that OOM-crashed memory-limited tabs. A regression that puts the disk back on the wasm heap (~+0.7 GB) or
+  // reintroduces the RAM doubling transient (~+0.9 GB) or materializes the whole snapshot trips this gate.
   expect(peakBytes as number, `boot peak memory must stay under ${PEAK_BUDGET / 1e9} GB (got ${((peakBytes as number) / 1e9).toFixed(2)} GB)`).toBeLessThan(PEAK_BUDGET);
 
   // The real dashboard is now mounted against the in-browser backend: chrome + sidebar nav, not a stub.
@@ -153,6 +167,22 @@ test("the in-browser holospaces backend resumes, authenticates, and renders the 
 
   // Client-side routing works under the project subpath (SPA fallback + router basename keep /hermes-web).
   await page.goto("models", { waitUntil: "load" });
-  await page.waitForFunction("window.__HOLO_BACKEND_READY__ === true", null, { timeout: 260_000 });
+  await page.waitForFunction("window.__HOLO_BACKEND_READY__ === true", null, { timeout: 330_000 });
   expect(new URL(page.url()).pathname).toMatch(/\/models$/);
+  await page.waitForTimeout(3000); // let the models page fire its reads
+
+  // FAIL-CLOSED dashboard-latency gate. Across the whole session the worker dialed the guest only for these
+  // GETs (a warm-seed hit is never dialed). The ONLY legitimate dials are /api/status (re-fetched live to
+  // stay fresh, k-aligned) and the egress-gated endpoints (model/skills/mcp/messaging/hermes-update — they
+  // can't be pre-seeded and fast-503 without the router). ANY other path here missed the seed and paid a
+  // ~10 s single-lane round-trip — the "dashboard takes an hour" regression. Keep the seed (SAFE_WARM_PATHS)
+  // in step with what the dashboard fetches.
+  // /api/config is dialed once by the boot's OWN health probe (holo-worker.ts confirms the in-guest Python
+  // answers a protected route, deliberately bypassing the seed) — not a dashboard read; /api/status is the
+  // k-aligned live refresh; the rest are egress-gated (can't be pre-seeded, fast-503 without the router).
+  const allowMiss = /^\/api\/(config\b|status\b|model\/(info|options|set|auxiliary)\b|models\b|skills|mcp\/|mcp\b|messaging\/|hermes\/update)/;
+  const uniqueGets = [...new Set(guestGets)];
+  const seedMisses = uniqueGets.filter((p) => !allowMiss.test(p));
+  recordConsole(`[seed-gate] ${uniqueGets.length} unique guest GETs; seed-miss(es): ${seedMisses.join(", ") || "none"}`);
+  expect(seedMisses, `dashboard local reads must hit the warm seed, not the slow guest lane: ${seedMisses.join(", ")}`).toEqual([]);
 });
