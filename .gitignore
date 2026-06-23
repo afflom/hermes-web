@@ -150,3 +150,6 @@ web/dist-pages/
 vv/
 web/src/lib/__screenshots__/
 web/.vitest-attachments/
+
+# native-exec backend bundle (built by web/scripts/bundle-hermes-native.mjs from the real Hermes source)
+web/public/native/
