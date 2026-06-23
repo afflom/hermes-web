@@ -1,6 +1,6 @@
 {
-  "kappa": "blake3:f6026ff7014a69ff3585a41d9a320610a9ee5a38113de8c879feb1e5197c547b",
-  "size": 1326976807,
+  "kappa": "blake3:b751bc961bef044292f12e6d357d245c73d09672df2e3e4978e53fb1e6436c69",
+  "size": 1327340839,
   "chunkGzip": true,
   "chunks": [
     {
@@ -105,7 +105,7 @@
     },
     {
       "name": "00025",
-      "size": 16256807
+      "size": 16620839
     }
   ]
 }
