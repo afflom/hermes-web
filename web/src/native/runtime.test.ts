@@ -17,6 +17,8 @@ const dec = (b: Uint8Array) => new TextDecoder().decode(b);
 
 describe("native-exec Hermes backend", () => {
   let backend: NativeBackend;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let py: any;
 
   beforeAll(async () => {
     // Build the artifacts from the REAL source (the same step the dashboard build runs).
@@ -24,7 +26,7 @@ describe("native-exec Hermes backend", () => {
     const manifest = JSON.parse(readFileSync(path.join(NATIVE, "deps.json"), "utf8")) as NativeManifest;
     const sourceTar = readFileSync(path.join(NATIVE, "hermes-src.tar"));
     const osSurfacePy = readFileSync(path.join(REPO, "web/src/native/os_surface.py"), "utf8");
-    const py = await loadPyodide({ stdout: () => {}, stderr: () => {} });
+    py = await loadPyodide({ stdout: () => {}, stderr: () => {} });
     backend = await bootNativeBackend(py as never, { manifest, sourceTar, osSurfacePy });
   }, 180_000);
 
@@ -102,5 +104,37 @@ describe("native-exec Hermes backend", () => {
     expect(resp.id, "the dispatch reply carries our request id").toBe(1);
     expect(resp.result !== undefined || resp.error !== undefined, "a well-formed JSON-RPC reply (dispatch ran)").toBe(true);
     backend.closeSocket(sid);
+  });
+
+  // G6-codec: the native network surface speaks the EXACT established CC-16 egress wire format the router
+  // extension (background.js) and the guest's wsnet.rs already use — so the agent's outbound sockets reuse the
+  // one egress channel, DRY. A byte-level mismatch would silently break every outbound call, so pin it here.
+  it("G6: os_net encodes/decodes the established CC-16 egress frames byte-for-byte", () => {
+    const osNetPy = readFileSync(path.join(REPO, "web/src/native/os_net.py"), "utf8");
+    const out = py.runPython(`
+import sys, types
+_m = types.ModuleType("os_net"); exec(${JSON.stringify(osNetPy)}, _m.__dict__)
+# OPEN id=1 → 1.2.3.4:443  == 0x01, id(4 BE), ip(4), port(2 BE)
+_open = _m.encode_open(1, (1, 2, 3, 4), 443)
+# DATA id=1 body=b"hi"
+_data = _m.encode_data(1, b"hi")
+# parse an ext→tab RDATA id=7 body=b"ok"  (0x12, 00000007, 'ok')
+_op, _cid, _body = _m.parse_frame(bytes([0x12, 0, 0, 0, 7]) + b"ok")
+import json
+json.dumps({
+  "open": list(_open),
+  "data": list(_data),
+  "rdata": [_op, _cid, _body.decode()],
+  "ipv4_name": _m.ipv4_of("api.anthropic.com"),   # a name → None (needs DNS)
+  "ipv4_dotted": _m.ipv4_of("127.0.0.1"),
+})
+`) as string;
+    const r = JSON.parse(out);
+    // OPEN 1.2.3.4:443 — op, id big-endian, ip octets, port big-endian (443 = 0x01BB).
+    expect(r.open).toEqual([0x01, 0, 0, 0, 1, 1, 2, 3, 4, 0x01, 0xbb]);
+    expect(r.data).toEqual([0x02, 0, 0, 0, 1, 0x68, 0x69]); // "hi"
+    expect(r.rdata).toEqual([0x12, 7, "ok"]);
+    expect(r.ipv4_name).toBeNull(); // a hostname needs DNS (resolved separately), not a dotted-quad
+    expect(r.ipv4_dotted).toEqual([127, 0, 0, 1]);
   });
 });
