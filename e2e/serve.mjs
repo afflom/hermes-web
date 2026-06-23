@@ -33,6 +33,34 @@ const server = createServer(async (req, res) => {
   try {
     let urlPath = decodeURIComponent((req.url || "/").split("?")[0].split("#")[0]);
     if (PREFIX && (urlPath === PREFIX || urlPath.startsWith(PREFIX + "/"))) urlPath = urlPath.slice(PREFIX.length) || "/";
+
+    // Same-origin mock model for the native-agent e2e: the native LLM call (httpx → egress → run_sync → fetch)
+    // round-trips here without a real provider/key or cross-origin CORS. POST chat/completions streams an SSE
+    // reply; the agent's provider-detection GETs (/v1/models, /api/tags, /v1/props, /version, …) get a permissive
+    // JSON so detection succeeds instead of retry-storming and eating the turn budget.
+    if (urlPath.startsWith("/mock-llm/")) {
+      req.resume(); // drain any request body we don't need
+      if (req.method === "POST") {
+        const reply = "native-browser-turn-ok-3b9f";
+        const sse =
+          `data: {"id":"mock","object":"chat.completion.chunk","model":"custom/mock","choices":[{"index":0,"delta":{"role":"assistant","content":${JSON.stringify(reply)}},"finish_reason":null}]}\n\n` +
+          `data: {"id":"mock","object":"chat.completion.chunk","model":"custom/mock","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n` +
+          `data: [DONE]\n\n`;
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.end(sse);
+      } else {
+        const discovery = {
+          object: "list",
+          data: [{ id: "custom/mock", object: "model", owned_by: "mock" }],
+          models: [{ name: "custom/mock", model: "custom/mock" }], // Ollama /api/tags shape
+          version: "0.0.0",
+          default_generation_settings: {}, // llama.cpp /v1/props shape
+        };
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(discovery));
+      }
+      return;
+    }
     if (urlPath.endsWith("/")) urlPath += "index.html";
     const rel = normalize(urlPath).replace(/^([/\\])+/, "").replace(/^(\.\.[/\\])+/, "");
     let file = join(ROOT, rel);

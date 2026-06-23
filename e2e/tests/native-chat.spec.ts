@@ -66,3 +66,57 @@ test("all-native: ?native=1 serves the dashboard AND the threaded agent gateway 
   const body = await page.locator("body").innerText();
   expect(body, "dashboard not in an error state").not.toMatch(/failed to load|error loading|backend unavailable/i);
 });
+
+// The capstone, in the BROWSER: a full chat turn runs all-native — agent build + the STREAMING LLM call, whose
+// sync httpx is bridged to the async fetch egress by run_sync (JSPI). Node proves the WHOLE logic with a sync
+// fake (9/9). The egress itself is verified working in-browser too (the agent's outbound requests — provider
+// discovery + the chat POST — all go out over httpfetch). BLOCKED, documented: run_sync does not SUSPEND in the
+// deep live agent context (ASGI app → handle_ws → dispatch → nested cooperative threads → run_sync), though it
+// suspends in every isolation test (incl. via the to_thread shim). So the egress RESPONSES arrive after the turn
+// instead of during it, and no reply streams. Skipped until the run_sync-suspension context is resolved (the
+// last piece for native chat); the guest default serves full chat meanwhile.
+test.fixme("all-native: a full chat turn runs native in the browser (LLM via egress + run_sync)", async ({ page }) => {
+  test.setTimeout(180_000);
+  page.on("console", (m) => console.log(`[browser:${m.type()}] ${m.text()}`));
+  page.on("pageerror", (e) => console.log(`[browser:pageerror] ${e.message}`));
+
+  await page.goto("./?native=1", { waitUntil: "load" });
+  await page.waitForFunction("window.__HOLO_BACKEND_READY__ === true", null, { timeout: 120_000 });
+
+  // Point the agent at the same-origin mock model (no real provider/key) via the real config API.
+  const cfg = await page.evaluate(async () => {
+    const yaml =
+      'model:\n  default: "custom/mock"\n  provider: "custom"\n' +
+      `  base_url: "${location.origin}/hermes-web/mock-llm/v1"\n  api_key: "mock-key"\n  api_mode: "chat_completions"\n`;
+    const r = await window.__HOLO_FETCH__!("/api/config/raw", {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ yaml_text: yaml }),
+    });
+    return r.status;
+  });
+  expect(cfg, "model config written via /api/config/raw").toBeLessThan(300);
+
+  // Drive a real turn over the native chat WS and assert the mocked reply streams back.
+  const reply = await page.evaluate(
+    () =>
+      new Promise<string>((resolve, reject) => {
+        const ws = window.__HOLO_WS__!("/api/ws");
+        let sessionId = "";
+        const timer = setTimeout(() => reject(new Error(`no assistant reply in 120s (session=${sessionId})`)), 120_000);
+        ws.addEventListener("message", (ev) => {
+          const data = typeof ev.data === "string" ? ev.data : "";
+          if (data.includes("native-browser-turn-ok-3b9f")) { clearTimeout(timer); ws.close(); resolve(data); return; }
+          let m: { params?: { type?: string; payload?: { message?: string } }; id?: number; result?: { session_id?: string; id?: string } };
+          try { m = JSON.parse(data); } catch { return; }
+          if (m.params?.type === "error" || m.params?.type === "message.end") console.log(`[WSEVT] ${m.params.type} ${JSON.stringify(m.params.payload ?? "")}`);
+          if (m.params?.type === "gateway.ready") {
+            ws.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "session.create", params: { title: "browser-turn" } }));
+          } else if (m.id === 1 && m.result) {
+            sessionId = m.result.session_id ?? m.result.id ?? "";
+            ws.send(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "prompt.submit", params: { session_id: sessionId, text: "say it" } }));
+          }
+        });
+        ws.addEventListener("error", (ev) => { clearTimeout(timer); reject(new Error(`ws error: ${String(ev.data ?? "")}`)); });
+      }),
+  );
+  expect(reply, "the mock model's reply streamed through the full native turn").toContain("native-browser-turn-ok-3b9f");
+});
