@@ -52,17 +52,23 @@ function serveContent(port) {
   port.onMessage.addListener(async (msg) => {
     if (!msg || msg.type !== "fetch" || typeof msg.url !== "string") return;
     try {
+      // method + headers + body so this serves the agent's outbound LLM call too (a cross-origin POST the page
+      // can't make), not just registry GETs. The service worker's fetch is CORS-exempt (host_permissions).
       const resp = await fetch(msg.url, {
         method: msg.method || "GET",
         headers: msg.headers || {},
+        body: msg.body != null ? new Uint8Array(msg.body) : undefined,
         redirect: "follow",
       });
       const buf = new Uint8Array(await resp.arrayBuffer());
       const CHUNK = 256 * 1024;
+      const headers = [];
+      resp.headers.forEach((v, k) => headers.push([k, v])); // the LLM transport needs the response headers
       port.postMessage({
         type: "head",
         id: msg.id,
         status: resp.status,
+        headers,
         contentType: resp.headers.get("content-type") || "",
         total: buf.length,
       });

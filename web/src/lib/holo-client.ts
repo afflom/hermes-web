@@ -200,20 +200,18 @@ export async function bootWorkerTransport(report: (p: HologramBootProgress) => v
     report(p);
   };
 
-  // Backend selection (DRY — same protocol either way). The native-exec worker runs the REAL Hermes Python on
-  // the browser peer's JS engine (Pyodide, hologram-native) and serves the single-threaded dashboard HTTP fast;
-  // the emulated guest worker resumes the warm-κ guest and serves the threaded agent over CC-33. `?native=1`
-  // enables the per-transport split; without it, ONE guest worker serves both (current production). The split
-  // becomes default once G5b/G6/G3 are green (PLAN.md, no prototype back-compat).
-  const split = typeof location !== "undefined" && new URLSearchParams(location.search).get("native") === "1";
-  splitMode = split;
+  // Backend selection (DRY — same protocol either way). `?native=1` runs the WHOLE backend NATIVE: ONE
+  // native-exec worker (the real Hermes Python on the browser peer's JS engine, Pyodide) serves the dashboard
+  // HTTP, the threaded agent WS (the cooperative thread surface), AND the LLM-call egress — no emulator, so
+  // none of its cost (128 s boot, 377 MB κ, >360 s establishment). Without it, the emulated warm-κ guest serves
+  // both (current production: real cross-origin LLM over CC-16). All-native is opt-in until its cross-origin
+  // LLM egress (the extension's CORS-free fetch) is verified, then it becomes the default and the guest retires.
+  const native = typeof location !== "undefined" && new URLSearchParams(location.search).get("native") === "1";
+  splitMode = false; // one worker serves both transports — the per-transport split is retired (the agent runs native)
   const newGuest = () => new Worker(new URL("./holo-worker.ts", import.meta.url), { type: "module", name: "holospaces" });
-  if (split) {
-    httpWorker = new Worker(new URL("../native/worker.ts", import.meta.url), { type: "module", name: "hermes-native" });
-    wsWorker = newGuest();
-  } else {
-    httpWorker = wsWorker = newGuest(); // one worker, both transports
-  }
+  httpWorker = wsWorker = native
+    ? new Worker(new URL("../native/worker.ts", import.meta.url), { type: "module", name: "hermes-native" })
+    : newGuest();
 
   // Wire the agent's egress (outbound LLM/tool traffic) to the router extension if present — this belongs to the
   // GUEST worker, where the agent runs (relay guest <-> extension).
@@ -237,7 +235,10 @@ export async function bootWorkerTransport(report: (p: HologramBootProgress) => v
       if (!headers.has("authorization")) headers.set("authorization", `Bearer ${token}`);
       return workerFetch(path, { ...init, headers });
     };
-    w.__HOLO_WS__ = (path: string) => new WorkerSocket(path);
+    w.__HOLO_WS__ = (path: string) => {
+      const sep = path.includes("?") ? "&" : "?";
+      return new WorkerSocket(`${path}${sep}token=${encodeURIComponent(token)}`); // auth: the gateway WS checks ?token=
+    };
     // Seed-capture hook: a RAW guest GET that bypasses seed/status/egress handlers (capture e2e records the
     // backend's true response per path). Targets the HTTP backend.
     w.__HOLO_CAPTURE__ = (path: string): Promise<Response> => {
@@ -256,8 +257,8 @@ export async function bootWorkerTransport(report: (p: HologramBootProgress) => v
     guestToken = token;
     const w = window as unknown as Record<string, unknown>;
     w.__HOLO_AGENT_READY__ = true;
-    if (!split) armSockets();
-    onProgress({ phase: "ready", detail: split ? "agent backend resumed (guest, warming)" : "in-browser backend live" });
+    armSockets(); // one worker serves WS immediately (native: no establishment; guest: dashboard reads warm it)
+    onProgress({ phase: "ready", detail: native ? "native backend live (dashboard + agent)" : "in-browser backend live" });
   }
 
   await new Promise<void>((resolve, reject) => {
@@ -273,25 +274,12 @@ export async function bootWorkerTransport(report: (p: HologramBootProgress) => v
         w.__HERMES_DASHBOARD_EMBEDDED_CHAT__ = m.embedded;
         w.__HERMES_AUTH_REQUIRED__ = m.authRequired;
         installHttp(m.token);
-        if (!split) installWs(m.token); // one worker → wire both halves now
-        onProgress({ phase: "ready", detail: "in-browser backend live" });
+        installWs(m.token); // one worker → wire HTTP + WS together
+        onProgress({ phase: "ready", detail: native ? "native backend live (dashboard + agent)" : "in-browser backend live" });
         resolve();
       }
     };
-    httpWorker!.onerror = (e) => reject(new Error(`http worker error: ${e.message}`));
-
-    if (split) {
-      // GUEST (background) — wires the WS transport when the threaded agent backend is up. Its progress goes to
-      // logs/console so it doesn't fight the native dashboard's boot UI; failures are non-fatal to the dashboard.
-      wsWorker!.onmessage = (ev: MessageEvent<FromWorker>) => {
-        const m = ev.data;
-        if (handleData(m)) return;
-        if (m.t === "progress") { console.info("[holo:agent]", m.p.phase, m.p.detail ?? ""); return; }
-        if (m.t === "booterr") { console.error("[holo:agent] guest boot failed:", m.message); return; }
-        if (m.t === "ready") installWs(m.token);
-      };
-      wsWorker!.onerror = (e) => console.error("[holo:agent] guest worker error:", e.message);
-    }
+    httpWorker!.onerror = (e) => reject(new Error(`${native ? "native" : "guest"} worker error: ${e.message}`));
 
     // OPFS disk paging is opt-in (?holo-resume=opfs): lower memory but slower than the monolithic resume.
     const opfs = typeof location !== "undefined" && new URLSearchParams(location.search).get("holo-resume") === "opfs";
@@ -299,8 +287,7 @@ export async function bootWorkerTransport(report: (p: HologramBootProgress) => v
     // Egress-prober endpoints BLOCK in the guest waiting for a network reply; with no gateway that reply never
     // comes and the stuck handler holds the guest's single serving slot. Tell the guest whether egress is wired.
     const bootMsg: ToWorker = { t: "boot", base: HERMES_BASE_PATH, opfs, diag, egressAvailable: !!egress };
-    httpWorker!.postMessage(bootMsg);
-    if (split) wsWorker!.postMessage(bootMsg);
+    httpWorker!.postMessage(bootMsg); // httpWorker === wsWorker (one worker serves both transports)
   });
 }
 

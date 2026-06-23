@@ -6,31 +6,45 @@ hologram/holospaces native-exec approach: run the **real, unmodified Hermes Pyth
 allows, with the OS primitives it can't host (threads, processes, persistent FS) provided by the **holospace**
 over the CC-33 bridge. We *remove the interpreter wall where it isn't needed*, not the substrate.
 
-## Resolved architecture: the per-transport split (the holospaces-idiomatic answer)
-Investigation (CC-48 `node-exthost` + the local holo glue) established two load-bearing facts:
+## Resolved architecture: ALL-NATIVE (the interpreter wall removed for the whole agent)
+The bottleneck is the emulator interpreter wall: the wasm emulator re-executes the guest's first-ASGI path
+every browser session (>360 s "establishment"). κ-warming can't capture it (the bank already warms all
+endpoints; the browser still re-pays), so the only elimination is to **stop emulating — run native**. Two OS
+primitives Pyodide lacks blocked the agent from the native path; both are now backed cooperatively in the ONE
+`os_surface` seam, reusing the established substrate — NOT by emulating a CPU:
 
-1. **Pyodide cannot host OS threads.** The stock build raises `RuntimeError: can't start new thread`; the only
-   pthread build is an unreleased experimental branch whose spawned threads *cannot touch the JS FFI* (which our
-   loopback bridge needs). So native-exec is single-threaded, period.
-2. **Holospaces does not expose a host thread/process surface (CC-11).** CC-11 is a terminal *inside* the guest;
-   the ext-host borrows only the **filesystem (CC-15)**. There is no `HOST.exec`/`HOST.thread` to wire — the
-   `os_surface._install_process_surface` seam correctly *raises* rather than faking one. The guest is the only
-   place real threads exist, and the host reaches it by **dialing a server over CC-33** (not borrowing syscalls).
+1. **Threads.** Pyodide can't host OS threads (and there is no host thread surface: CC-11 is a terminal *inside*
+   the guest; the CC-48 ext-host borrows only fs). So the **cooperative thread surface** runs the real threaded
+   `tui_gateway` on the single event loop: `Thread.start()` runs inline; a blocking `Condition.wait` inside a
+   coop thread (the base of `Event.wait` / `queue.get` / background poll loops) unwinds — the single page
+   session has no second thread to satisfy it — while the non-blocking `wait(0)` fast path and already-ready
+   handoffs are untouched. Proven: gateway handshake + dispatch + a **full chat turn** run native (node 9/9).
+2. **Network (the LLM call).** Pyodide ships no `ssl`, so the HTTPS LLM call uses the BROWSER's TLS via the
+   **established egress** — the router extension's CORS-free fetch (its content role). One httpx-transport patch
+   (`os_net.install_http_egress`) routes every model SDK through it; `run_sync` (JSPI, present in the deploy
+   browser) bridges the sync SDK call to the async fetch. No new egress model — the same one the guest used.
 
-Therefore the deployed backend is **two backends behind one holo-protocol, split by transport**:
+Therefore the deployed backend is **ONE native-exec worker serving the WHOLE backend** behind the one
+holo-protocol — no emulator, no split, no guest:
 
-| Transport | Backend | Why |
-|-----------|---------|-----|
-| **HTTP `/api/*`** (dashboard reads+writes) | **native-exec (Pyodide)** | single-threaded, native-fast (15 ms vs >360 s); the common case, usable in ~8 s |
-| **WebSocket `/api/ws`** (chat / agent / tool exec) | **emulated guest** (`holo-worker`, dialed over CC-33) | the agent gateway is fundamentally threaded (`threading.Thread`, `Event`/`Lock`, `asyncio.to_thread`); real threads exist only in the guest |
-| **State (FS HOME)** | **guest filesystem over CC-15**, mounted by native | one coherent store so a dashboard read sees what a chat turn wrote — the ext-host's one borrowed surface |
+| Surface | How (all native, one Pyodide worker) |
+|---------|--------------------------------------|
+| **HTTP `/api/*`** (dashboard) | the real ASGI app in-process via httpx ASGITransport (15 ms vs >360 s) |
+| **WebSocket `/api/ws`** (chat / agent) | the real threaded gateway in-process via the ASGI-WS driver + the cooperative thread surface |
+| **LLM egress** | the agent's httpx → the established extension CORS-free fetch (browser TLS), `run_sync`-bridged |
+| **State (FS HOME)** | Pyodide FS (OPFS-persisted HOME is the G3 refinement) |
 
-The dashboard is live native-fast while the guest boots in the background for chat. `holo-client` already
-multiplexes the protocol; the change is to run *both* workers and route fetch→native, socket→guest.
+`?native=1` selects all-native (one `web/src/native/worker.ts`). It is opt-in until the cross-origin LLM egress
+(extension CORS-free POST) is verified end-to-end; then it becomes the default and the emulated guest retires.
+
+### Superseded: the per-transport split
+An earlier increment ran native HTTP + guest WS (the agent on the guest, dialed over CC-33), on the premise
+that real threads exist only in the guest. The cooperative thread surface removed that premise — the threaded
+agent runs native — so the split (and the guest) is retired. Recorded for trace; the all-native path replaces it.
 
 ## Principle: DRY, parametric, no bespoke
-- **Reuse the real Hermes Python verbatim** (no fork) and **reuse both existing substrates** (native runtime +
-  emulated guest). The split adds a router, not a new backend.
+- **Reuse the real Hermes Python verbatim** (no fork) and **reuse the established egress** (the extension
+  CORS-free fetch). The OS surfaces (threads, network) are ONE adapter each, not per-call patches.
 - **Single sources of truth.** Deps from `pyproject.toml`; source is the repo tree; ONE OS-surface adapter, ONE
   native runtime, ONE ASGI bridge (HTTP via httpx ASGITransport, WS via the in-process driver).
 - **Parametric** over the full agent — whole source + full dep set.
