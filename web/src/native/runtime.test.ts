@@ -217,4 +217,73 @@ json.dumps({"status": r.status_code, "json": r.json(), "calls": calls})
     expect(r.calls[0].auth, "auth header carried through to the egress").toBe("sk-test");
     expect(JSON.parse(r.calls[0].body).model).toBe("claude"); // the request body reached the egress
   });
+
+  // G6: THE CAPSTONE — a full chat turn runs NATIVE end-to-end. The cooperative thread surface runs the agent
+  // build + the turn inline; the LLM call rides the HTTP egress to a mock chat.completions model.
+  // STATUS: the turn progresses NATIVE through gateway.ready → session.create (model resolved from config) →
+  // prompt.submit → agent build → the LLM call — but then HANGS: a concurrency pattern in run_conversation
+  // (a blocking Event.wait / a thread meant to run *alongside* the main flow, not before it) deadlocks the
+  // single thread, which the inline cooperative model can't carry (it serializes what must overlap). Dispatch
+  // (G5b session.list) proves the surface; the turn's OVERLAPPING concurrency is the next frontier — it needs
+  // the thread surface to drive truly-concurrent threads cooperatively (yield at blocking points), not inline.
+  // Skipped so it can't wedge the single-threaded runtime / block CI until that lands.
+  it.skip("G6: a full chat turn runs NATIVE (build + LLM via egress → assistant reply)", async () => {
+    const osNetPy = readFileSync(path.join(REPO, "web/src/native/os_net.py"), "utf8");
+    const REPLY = "native-turn-ok-7f3a";
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    py.globals.set("_mock_fetch", (_m: string, _u: string, _h: unknown, _b: Uint8Array) => {
+      const body = JSON.stringify({
+        id: "chatcmpl-mock", object: "chat.completion", model: "custom/mock",
+        choices: [{ index: 0, message: { role: "assistant", content: REPLY }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+      });
+      return [200, [["content-type", "application/json"]], new TextEncoder().encode(body)];
+    });
+    py.runPython(`
+import os
+os.makedirs(os.path.expanduser("~/.hermes"), exist_ok=True)
+open(os.path.expanduser("~/.hermes/config.yaml"), "w").write(
+    'model:\\n  default: "custom/mock"\\n  provider: "custom"\\n'
+    '  base_url: "http://mock.local/v1"\\n  api_key: "mock-key"\\n  api_mode: "chat_completions"\\n')
+os.environ["HERMES_MODEL"] = "custom/mock"
+open("/native/os_net.py", "w").write(${JSON.stringify(osNetPy)})
+import os_net as _osnet
+def _fetch(method, url, headers, body):
+    res = _mock_fetch(method, url, headers, bytes(body))
+    arr = res.to_py() if hasattr(res, "to_py") else res
+    h = arr[1].to_py() if hasattr(arr[1], "to_py") else arr[1]
+    rb = arr[2].to_py() if hasattr(arr[2], "to_py") else arr[2]
+    return int(arr[0]), [list(x) for x in h], bytes(rb)
+_osnet.install_http_egress(_fetch)
+`);
+
+    let sid = 0;
+    let createSent = false;
+    let promptSent = false;
+    const events: unknown[] = [];
+    const done = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`no assistant reply in 45s; events=${JSON.stringify(events).slice(0, 3000)}`)), 45_000);
+      backend.onSocketEvent((e) => {
+        if (e.kind === "error") { clearTimeout(timer); reject(new Error(`ws error: ${e.data}`)); return; }
+        if (e.kind !== "message") return;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const m: any = JSON.parse(e.data);
+        events.push(m);
+        if (m.params?.type === "gateway.ready" && !createSent) {
+          createSent = true;
+          backend.sendSocket(sid, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "session.create", params: { title: "native-turn" } }));
+        } else if (m.id === 1 && m.result && !promptSent) {
+          promptSent = true;
+          const sessionId = m.result.session_id ?? m.result.id ?? m.result.session?.id ?? "";
+          backend.sendSocket(sid, JSON.stringify({ jsonrpc: "2.0", id: 2, method: "prompt.submit", params: { session_id: sessionId, text: "say the magic word" } }));
+        }
+        if (e.data.includes(REPLY)) { clearTimeout(timer); resolve(); } // the assistant reply streamed back
+      });
+    });
+    sid = backend.openSocket(`/api/ws?token=${backend.token}`);
+    await done;
+    // The mocked model's reply made it through the full native turn (gateway → build → egress LLM → stream).
+    expect(events.some((m) => JSON.stringify(m).includes(REPLY)), "assistant reply streamed over the native turn").toBe(true);
+    backend.closeSocket(sid);
+  }, 60_000);
 });

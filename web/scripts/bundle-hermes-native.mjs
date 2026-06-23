@@ -56,10 +56,18 @@ const required = [...depBlock.matchAll(/"([A-Za-z0-9_.\-]+)(\[[^\]]*\])?\s*([<>=
   // them from the base bundle lets Hermes's `except ImportError` guards degrade the agent's PTY cleanly.
   .filter((d) => !["psutil", "ptyprocess", "winpty", "pywinpty"].includes(d.name.toLowerCase()));
 
+// Pure-Python transitive deps of the provider SDKs that the runtime's deps=False fallback skips (the SDK is
+// force-installed past an unsatisfiable binary pin, so its own pure deps must be brought explicitly). distro +
+// tqdm are openai's; httpx/anyio/sniffio/pydantic already come from Hermes's own deps + loadPackage.
+const PROVIDER_PURE_DEPS = ["distro", "tqdm"];
+
 const manifest = {
   pyodide: "0.28.3",
-  loadPackage: [...LOAD_PACKAGE, "micropip"],
-  required: required.map((d) => `${d.name}${d.extras}${d.spec}`),
+  // sqlite3 (agent session state.db) + jiter (the Rust JSON core the OpenAI/Anthropic SDKs require) are
+  // Pyodide-distributed binary/stdlib packages — load the ABI-matched wheels from the Pyodide bundle so the
+  // provider SDK install resolves (micropip can't build their Rust deps). The base runtime doesn't include them.
+  loadPackage: [...LOAD_PACKAGE, "micropip", "sqlite3", "jiter"],
+  required: [...required.map((d) => `${d.name}${d.extras}${d.spec}`), ...PROVIDER_PURE_DEPS],
   // OS modules with no in-browser backing — the os_surface adapter stubs/routes these (DRY, one place).
   osSurface: ["psutil", "fcntl", "termios", "resource", "grp", "pwd"],
 };

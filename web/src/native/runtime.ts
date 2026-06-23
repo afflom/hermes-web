@@ -77,11 +77,16 @@ export async function bootNativeBackend(
   //    atomically (so one binary-pinned wheel absent from Pyodide would take the dashboard deps down with it).
   //    Installing each independently lets every resolvable dep install while a provider-only/binary dep (jiter,
   //    pillow, ruamel-clib …) degrades just that provider. DRY — one loop, no per-dep special-casing.
+  //    Fallback to deps=False when a dep fails: a provider SDK can pin a TRANSITIVE binary newer than the one
+  //    Pyodide ships (e.g. openai==2.24 wants jiter>=0.10, Pyodide has 0.9) — the pin is conservative and the
+  //    SDK runs fine on the shipped wheel, so force the package itself and let its pure deps come from the rest.
   const degraded = (await py.runPythonAsync(
     `import micropip, json\n_degraded=[]\n` +
       `for _r in json.loads(${q(JSON.stringify(opts.manifest.required))}):\n` +
       `  try:\n    await micropip.install(_r)\n` +
-      `  except Exception:\n    _degraded.append(_r.split('==')[0].split('>')[0].split('<')[0].split('[')[0].strip())\n` +
+      `  except Exception:\n` +
+      `    try:\n      await micropip.install(_r, deps=False)\n` +
+      `    except Exception:\n      _degraded.append(_r.split('==')[0].split('>')[0].split('<')[0].split('[')[0].strip())\n` +
       `",".join(_degraded)`,
   )) as string;
   log(degraded ? `deps installed (degraded providers: ${degraded})` : "deps installed");

@@ -15,6 +15,15 @@ const progress = (phase: string, detail: string) => post({ t: "progress", p: { p
 
 let backend: NativeBackend | null = null;
 
+// The dashboard's WS sids map onto the backend's ASGI-WS driver sids (both directions: send/close look up the
+// native sid by protocol sid; the driver's events look up the protocol sid by native sid).
+const sockets = new Map<number, number>(); // protocolSid → nativeSid
+const byNative = new Map<number, number>(); // nativeSid → protocolSid
+// Outbound HTTPS the agent's LLM call makes: each httpfetch is awaited on the main thread (the only place
+// chrome.runtime lives) and resolved here by fid when httpfetchres returns.
+let nextFid = 1;
+const pendingHttp = new Map<number, (r: { status: number; headers: [string, string][]; body: ArrayBuffer; error?: string }) => void>();
+
 ctx.onmessage = (e: MessageEvent<ToWorker>) => {
   const msg = e.data;
   switch (msg.t) {
@@ -27,16 +36,47 @@ ctx.onmessage = (e: MessageEvent<ToWorker>) => {
     case "capraw":
       serve(msg.rid, "GET", msg.path, msg.headers ?? {}, undefined);
       break;
-    case "wsopen":
-      // The agent's PTY is the holospace process/terminal surface (G5/G6); not native yet — fail cleanly so
-      // the dashboard degrades the chat rather than hanging.
-      post({ t: "wserr", sid: msg.sid, message: "agent PTY pending the holospace process surface (G5)" });
+    case "wsopen": {
+      // The agent gateway runs NATIVE (the cooperative thread surface), so the chat WS is served in-process by
+      // the ASGI WebSocket driver — no PTY, no emulator.
+      if (!backend) { post({ t: "wserr", sid: msg.sid, message: "native backend not ready" }); break; }
+      const nativeSid = backend.openSocket(msg.path);
+      sockets.set(msg.sid, nativeSid);
+      byNative.set(nativeSid, msg.sid);
       break;
-    // wssend / wsclose / egressin are wired with the agent + egress increments (G6/G7).
+    }
+    case "wssend": {
+      const nativeSid = sockets.get(msg.sid);
+      if (nativeSid != null && backend) backend.sendSocket(nativeSid, typeof msg.data === "string" ? msg.data : new TextDecoder().decode(msg.data));
+      break;
+    }
+    case "wsclose": {
+      const nativeSid = sockets.get(msg.sid);
+      if (nativeSid != null && backend) backend.closeSocket(nativeSid);
+      sockets.delete(msg.sid);
+      break;
+    }
+    case "httpfetchres": {
+      const resolve = pendingHttp.get(msg.fid);
+      if (resolve) { pendingHttp.delete(msg.fid); resolve(msg); }
+      break;
+    }
     default:
       break;
   }
 };
+
+// host.fetch — the agent's outbound HTTPS (the LLM call). The worker can't reach chrome.runtime, so it asks the
+// main thread to perform the request via the extension's CORS-free fetch; run_sync (in the runtime) suspends the
+// wasm stack until httpfetchres returns. Returns [status, headers, bodyBytes] for the Python httpx transport.
+function hostFetch(method: string, url: string, headers: [string, string][], body: Uint8Array): Promise<[number, [string, string][], Uint8Array]> {
+  const fid = nextFid++;
+  const buf = body && body.byteLength ? (body.slice().buffer as ArrayBuffer) : new ArrayBuffer(0);
+  return new Promise((resolve) => {
+    pendingHttp.set(fid, (r) => resolve([r.status, r.headers, new Uint8Array(r.body)]));
+    post({ t: "httpfetch", fid, method, url, headers, body: buf }, [buf]);
+  });
+}
 
 // Base-aware native-asset URL — same vite BASE_URL the (working) κ fetch uses, NOT the boot message.
 function nativeUrl(rel: string): string {
@@ -55,17 +95,32 @@ async function boot(): Promise<void> {
   const py = await loadPyodide({ indexURL: PYODIDE_CDN, stdout: () => {}, stderr: () => {} });
 
   progress("snapshot", "fetching the Hermes backend");
-  const [manifest, sourceTar, osSurfacePy] = await Promise.all([
+  const [manifest, sourceTar, osSurfacePy, osNetPy] = await Promise.all([
     fetchOk("deps.json").then((r) => r.json() as Promise<NativeManifest>),
     fetchOk("hermes-src.tar").then((r) => r.arrayBuffer()).then((x) => new Uint8Array(x)),
     fetchOk("os_surface.py").then((r) => r.text()),
+    fetchOk("os_net.py").then((r) => r.text()),
   ]);
 
   progress("resume", "installing the real Hermes backend (native)");
   backend = await bootNativeBackend(py as never, {
-    manifest, sourceTar, osSurfacePy,
+    manifest, sourceTar, osSurfacePy, osNetPy,
+    // The agent's outbound HTTPS rides the egress (the LLM call); host.fetch returns a Promise the runtime
+    // suspends on with run_sync (JSPI). The native gateway's threads run on the cooperative thread surface.
+    host: { fetch: hostFetch as never },
     log: (m) => post({ t: "log", level: "info", msg: `[native] ${m}` }),
   });
+
+  // Relay the ASGI-WS driver's events back to the dashboard over the holo-protocol (native sid → protocol sid).
+  backend.onSocketEvent((ev) => {
+    const psid = byNative.get(ev.sid);
+    if (psid == null) return;
+    if (ev.kind === "accept") post({ t: "wsopened", sid: psid });
+    else if (ev.kind === "message") post({ t: "wsmsg", sid: psid, data: ev.data });
+    else if (ev.kind === "close") { post({ t: "wsclosed", sid: psid, code: ev.code, reason: ev.data }); byNative.delete(ev.sid); }
+    else if (ev.kind === "error") post({ t: "wserr", sid: psid, message: ev.data });
+  });
+
   post({ t: "log", level: "info", msg: `[native] backend ready in ${((Date.now() - t0) / 1000).toFixed(1)}s` });
   post({ t: "ready", token: backend.token, embedded: true, authRequired: false });
 }

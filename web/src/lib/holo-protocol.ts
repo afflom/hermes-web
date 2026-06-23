@@ -20,7 +20,11 @@ export type ToWorker =
   | { t: "wsopen"; sid: number; path: string }
   | { t: "wssend"; sid: number; data: string | ArrayBuffer; binary: boolean }
   | { t: "wsclose"; sid: number }
-  | { t: "egressin"; frame: Uint8Array }; // a reply frame from the extension's sockets
+  | { t: "egressin"; frame: Uint8Array } // a reply frame from the extension's sockets
+  // The native agent's outbound HTTPS (the LLM call): the worker can't reach chrome.runtime, so it asks the
+  // main thread to perform the request via the extension's CORS-free fetch (the browser does DNS+TLS+HTTP,
+  // since Pyodide has no ssl). The worker blocks on this with run_sync (JSPI).
+  | { t: "httpfetchres"; fid: number; status: number; headers: [string, string][]; body: ArrayBuffer; error?: string };
 
 /** worker → main */
 export type FromWorker =
@@ -34,6 +38,9 @@ export type FromWorker =
   | { t: "wsclosed"; sid: number; code: number; reason: string }
   | { t: "wserr"; sid: number; message: string }
   | { t: "egressout"; frame: Uint8Array } // a guest frame to carry to the extension
+  // The native agent asks the main thread to perform an outbound HTTPS request (the LLM call) via the
+  // extension's CORS-free fetch; the main thread replies with `httpfetchres` (matched by fid).
+  | { t: "httpfetch"; fid: number; method: string; url: string; headers: [string, string][]; body: ArrayBuffer | null }
   | { t: "apiok"; ok: boolean } // background /api/status verification result
   | { t: "peakbytes"; bytes: number } // boot memory peak (JS bytes held + wasm memory) — gated by the BDD
   | { t: "log"; level: "info" | "warn" | "error" | "guest"; msg: string }; // surfaced diagnostics

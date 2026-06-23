@@ -167,6 +167,27 @@ function handleData(m: FromWorker): boolean {
   }
 }
 
+/** Answer the native agent's outbound HTTPS (the LLM call) — the worker can't reach chrome.runtime, so the
+ *  request lands on the main thread. A same-origin endpoint (e2e mock, or a CORS-enabled provider) resolves via
+ *  the page's fetch directly; cross-origin providers (CORS-blocked) route through the extension's CORS-free
+ *  fetch (the established content egress), wired with the cross-origin-provider increment. */
+async function answerHttpFetch(worker: Worker, m: Extract<FromWorker, { t: "httpfetch" }>): Promise<void> {
+  try {
+    const res = await fetch(m.url, {
+      method: m.method,
+      headers: m.headers,
+      body: m.body && m.body.byteLength ? m.body : undefined,
+    });
+    const buf = await res.arrayBuffer();
+    const headers: [string, string][] = [];
+    res.headers.forEach((v, k) => headers.push([k, v]));
+    worker.postMessage({ t: "httpfetchres", fid: m.fid, status: res.status, headers, body: buf }, [buf]);
+  } catch (e) {
+    const empty = new ArrayBuffer(0);
+    worker.postMessage({ t: "httpfetchres", fid: m.fid, status: 0, headers: [], body: empty, error: String(e) }, [empty]);
+  }
+}
+
 /** Boot the worker-hosted backend. Resolves once the HTTP (dashboard) backend serves; the guest WS backend
  *  finishes booting in the background and wires the socket factory when ready. */
 export async function bootWorkerTransport(report: (p: HologramBootProgress) => void = () => {}): Promise<void> {
@@ -243,6 +264,7 @@ export async function bootWorkerTransport(report: (p: HologramBootProgress) => v
     // HTTP (native, or the shared guest) — drives the main boot UI + resolves bootWorkerTransport.
     httpWorker!.onmessage = (ev: MessageEvent<FromWorker>) => {
       const m = ev.data;
+      if (m.t === "httpfetch") { answerHttpFetch(httpWorker!, m); return; } // native agent's outbound LLM call
       if (handleData(m)) return;
       if (m.t === "progress") { onProgress(m.p); return; }
       if (m.t === "booterr") { reject(new Error(m.message)); return; }
