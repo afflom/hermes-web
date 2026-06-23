@@ -55,4 +55,31 @@ describe("native-exec Hermes backend", () => {
     expect(dec(list.body)).toContain("native_probe_job"); // the write persisted + is read back, all native
     await backend.request("DELETE", `/api/cron/jobs/${id}?profile=default`, auth);
   });
+
+  // G5a: the in-process ASGI WebSocket driver is the WS analogue of the httpx HTTP path. It DRIVES the real
+  // /api/ws route (the actual tui_gateway, no PTY) — proving the driver is wired correctly. But the gateway is
+  // fundamentally THREADED: importing tui_gateway.server spawns a daemon reaper thread, and Pyodide has no
+  // pthreads, so the native attempt fails with "can't start new thread". The driver must surface that as a clean
+  // ERROR EVENT (never a hang). This is exactly WHY the chat/agent WS routes to the emulated guest (which has
+  // real threads) while the dashboard stays native — the holospaces per-transport split (PLAN.md G5).
+  it("G5a: the ASGI WS driver drives real /api/ws + surfaces the threading boundary cleanly (→ guest)", async () => {
+    const events: { kind: string; data: string }[] = [];
+    const settled = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`WS driver hung (no event in 15s); events=${JSON.stringify(events)}`)), 15_000);
+      backend.onSocketEvent((e) => {
+        events.push({ kind: e.kind, data: e.data });
+        if (e.kind === "error" || (e.kind === "message" && e.data.includes("gateway.ready"))) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+    });
+    const sid = backend.openSocket(`/api/ws?token=${backend.token}`);
+    await settled; // resolves on a clean event — the point is it does NOT hang
+    const err = events.find((e) => e.kind === "error");
+    // The threaded gateway can't boot under single-threaded Pyodide → confirmed boundary that routes chat to the
+    // guest. (If a future pthread substrate lands, this asserts the driver still drives the real route.)
+    expect(err?.data, "native /api/ws surfaces the thread boundary (not a hang)").toMatch(/can't start new thread/);
+    backend.closeSocket(sid);
+  });
 });

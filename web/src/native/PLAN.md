@@ -1,60 +1,78 @@
 # Native-exec hermes-agent — full implementation plan (DRY, BDD-gated)
 
 ## Goal
-hermes-web = a **completely functional hermes-agent**, deployed to GitHub Pages, running the **real, unmodified
-Hermes Python natively** (Pyodide on the browser peer's JS engine — CC-48's native-exec surface), with the OS
-primitives (FS / process / terminal / network) provided by the **holospace** over the CC-33 bridge. We *remove
-the interpreter wall* (Python in the emulated guest), not the substrate. Proven: the whole FastAPI app serves
-`/api/config` in 15 ms native vs >360 s emulated.
+hermes-web = a **completely functional hermes-agent**, deployed to GitHub Pages, optimized with the
+hologram/holospaces native-exec approach: run the **real, unmodified Hermes Python** as fast as the substrate
+allows, with the OS primitives it can't host (threads, processes, persistent FS) provided by the **holospace**
+over the CC-33 bridge. We *remove the interpreter wall where it isn't needed*, not the substrate.
+
+## Resolved architecture: the per-transport split (the holospaces-idiomatic answer)
+Investigation (CC-48 `node-exthost` + the local holo glue) established two load-bearing facts:
+
+1. **Pyodide cannot host OS threads.** The stock build raises `RuntimeError: can't start new thread`; the only
+   pthread build is an unreleased experimental branch whose spawned threads *cannot touch the JS FFI* (which our
+   loopback bridge needs). So native-exec is single-threaded, period.
+2. **Holospaces does not expose a host thread/process surface (CC-11).** CC-11 is a terminal *inside* the guest;
+   the ext-host borrows only the **filesystem (CC-15)**. There is no `HOST.exec`/`HOST.thread` to wire — the
+   `os_surface._install_process_surface` seam correctly *raises* rather than faking one. The guest is the only
+   place real threads exist, and the host reaches it by **dialing a server over CC-33** (not borrowing syscalls).
+
+Therefore the deployed backend is **two backends behind one holo-protocol, split by transport**:
+
+| Transport | Backend | Why |
+|-----------|---------|-----|
+| **HTTP `/api/*`** (dashboard reads+writes) | **native-exec (Pyodide)** | single-threaded, native-fast (15 ms vs >360 s); the common case, usable in ~8 s |
+| **WebSocket `/api/ws`** (chat / agent / tool exec) | **emulated guest** (`holo-worker`, dialed over CC-33) | the agent gateway is fundamentally threaded (`threading.Thread`, `Event`/`Lock`, `asyncio.to_thread`); real threads exist only in the guest |
+| **State (FS HOME)** | **guest filesystem over CC-15**, mounted by native | one coherent store so a dashboard read sees what a chat turn wrote — the ext-host's one borrowed surface |
+
+The dashboard is live native-fast while the guest boots in the background for chat. `holo-client` already
+multiplexes the protocol; the change is to run *both* workers and route fetch→native, socket→guest.
 
 ## Principle: DRY, parametric, no bespoke
-- **Reuse the real Hermes Python verbatim.** No fork, no stub of the backend. The deployed code IS the repo's
-  Python, bundled by a build step.
-- **Single sources of truth.** Deps come from `pyproject.toml`; source is the repo tree; there is exactly ONE
-  OS-surface adapter, ONE runtime, ONE ASGI bridge — never per-module / per-dep patches.
-- **Parametric.** Supports the full agent: the whole source + the full dep set (required eagerly, provider-optional
-  lazily). New providers/tools need no hermes-web change.
+- **Reuse the real Hermes Python verbatim** (no fork) and **reuse both existing substrates** (native runtime +
+  emulated guest). The split adds a router, not a new backend.
+- **Single sources of truth.** Deps from `pyproject.toml`; source is the repo tree; ONE OS-surface adapter, ONE
+  native runtime, ONE ASGI bridge (HTTP via httpx ASGITransport, WS via the in-process driver).
+- **Parametric** over the full agent — whole source + full dep set.
 
-## Architecture (the DRY pieces)
-1. **`hermes-native-bundle`** (build step, `web/scripts/`): tars the real Hermes Python (`hermes_cli/`, `gateway/`,
-   `agent/`, root modules…) + emits a dep manifest derived from `pyproject.toml`. One artifact, content-addressed.
-2. **Native runtime worker** (`web/src/lib/native/runtime.ts`): loads Pyodide, installs the manifest deps, unpacks
-   the source bundle, installs the OS-surface adapter, imports the real `web_server.app`. Replaces the emulated
-   boot in `holo-worker.ts`.
-3. **OS-surface adapter** (`web/src/lib/native/os_surface.py` + a JS bridge) — THE DRY core: one shim backing
-   Python's `os`/`open`/`subprocess`/`pty`/`socket`/`psutil` with the holospace primitives over CC-33. The Python
-   analogue of CC-48's `node-exthost` fs/net adapters. NOT per-module stubs.
-   - filesystem → holospace FS (CC-15) / OPFS
-   - process + terminal (subprocess / execvp / PTY) → holospace process surface (CC-11)
-   - network (egress) → the existing extension bridge (`holo-egress`, reused)
-4. **ASGI bridge** (`web/src/lib/native/asgi.ts`): the dashboard's `window.__HOLO_FETCH__` / WS → the in-Pyodide
-   ASGI `app`. Reuse `holo-client`'s existing bridge surface so the dashboard is unchanged.
-5. **Repurposed guest, not back-compat:** the emulated machine is reduced to (at most) the OS-primitive provider
-   the agent's shell tools dial over the bridge; the Hermes Python no longer runs there. (If the holospace exposes
-   a native process surface, the guest is dropped entirely — decided at gate 5.)
+## The DRY pieces
+1. **`bundle-hermes-native.mjs`** (build) — tars the whole repo's Python + a `pyproject`-derived dep manifest.
+2. **`runtime.ts`** — env-agnostic native backend: installs deps, unpacks source, OS-surface adapter, serves the
+   real ASGI app in-process. HTTP via `httpx.ASGITransport`; **WS via the in-process ASGI websocket driver**
+   (`_NativeWS`) — present and correct, used for any single-threaded socket; the *threaded* `/api/ws` routes to
+   the guest instead.
+3. **`os_surface.py`** — the ONE OS-surface adapter. Absent-OS modules degrade to catchable `OSError`. The
+   process/thread seam *raises* (no host surface exists) — the guest provides those, not a stub.
+4. **`worker.ts`** (native) — boots Pyodide + the bundle; speaks the holo-protocol for HTTP.
+5. **`holo-worker.ts`** (guest) — unchanged; serves the threaded agent over CC-33 (chat WS, egress).
+6. **`holo-client.ts`** — the **dual-worker router**: native worker for HTTP, guest worker for WS, one protocol.
+7. **FS-over-CC-15 adapter** — a Pyodide FS that proxies HOME to the guest filesystem so state is coherent.
 
-## BDD gates (each increment fails closed first, then made green)
-- **G1 runtime** — the *full* Hermes imports under Pyodide (node + browser) with the parametric dep set.
-- **G2 dashboard** — real `/api` reads **and writes** round-trip < 2 s in the browser (was >360 s).
-- **G3 fs** — config/file persistence round-trips through the FS adapter.
-- **G4 dashboard-complete** — every local dashboard tab loads native (the existing features.spec, repointed).
-- **G5 process** — a real agent tool (a shell command / git) runs through the holospace process surface; output
-  round-trips. *(This gate decides the guest's fate.)*
-- **G6 agent** — a full chat turn (LLM + tool use) completes over the native backend.
-- **G7 egress** — egress endpoints + the agent's outbound work over the reused extension bridge.
-- **G8 deploy** — the live GitHub Pages instance is a completely functional hermes-agent (live smoke = G4+G6).
+## BDD gates
+- **G1 runtime** — full Hermes imports under Pyodide. ✅
+- **G2 dashboard** — real `/api` reads+writes < 2 s native. ✅
+- **G4 dashboard-complete** — every local dashboard tab native in the browser. ✅
+- **G5 transport split** — the chat WebSocket routes to the guest while the dashboard stays native; both live
+  under one client. *(Supersedes the old "process surface" G5 — that surface does not exist.)*
+  - **G5a** the native in-process ASGI WS driver accepts `/api/ws` + emits `gateway.ready` (single-threaded
+    proof the driver is correct). Blocked natively only by the gateway's import-time thread → confirms the split.
+  - **G5b** the dual-worker router: HTTP→native, WS→guest, shared token, in the browser.
+- **G6 agent** — a full chat turn (LLM + tool use) completes over the guest WS while the dashboard is native.
+- **G3 fs** — state coherence: native HOME mounted on the guest FS over CC-15 (a chat write shows in the
+  dashboard's Sessions/history reads).
+- **G7 egress** — the agent's outbound LLM/tool traffic over the reused extension bridge (guest path).
+- **G8 deploy** — the live Pages instance is a completely functional hermes-agent: native dashboard + guest
+  agent, `?native=1` promoted to default once G5b/G6/G3 are green.
 
-## Increments (sequenced; each lands its gate)
-1. Bundle build + manifest (G1, node). 2. Native runtime worker (G1, browser). 3. FS adapter (G3) + dashboard
-wiring (G2). 4. Repoint features.spec → native (G4). 5. Process surface adapter (G5) — the frontier. 6. Agent
-loop + chat (G6). 7. Egress (G7). 8. Cut the deploy from emulated-κ to native; retire the κ pipeline (G8).
+## Sequence
+1. ✅ Bundle + runtime + native dashboard (G1/G2/G4). 2. ✅ Native ASGI WS driver (G5a — correct; proves the
+threaded gateway needs the guest). 3. Dual-worker router: HTTP→native, WS→guest (G5b). 4. Chat turn over the
+split (G6). 5. State coherence via CC-15 (G3). 6. Egress (G7). 7. Promote `?native=1` to default; the guest is
+retained as the threaded-agent substrate, NOT retired (G8).
 
-## Open frontier (called out honestly)
-G5 (process surface) is the deep unknown: whether the holospace exposes a process/exec/PTY surface the agent's
-`subprocess` can target, or whether that is itself substrate work in holospaces. Increments 1–4 (the proven
-native dashboard) do not depend on it and deliver immediate value; G5 is where we confirm the path to *full*
-agent functionality and decide the guest's role.
-
-## What we retire (no back-compat)
-The warm-κ emulated-guest path (`holo-worker` resume, the κ CAS, the establishment-hiding seed-served-auth, the
-re-bank pipeline) is replaced once G4/G6/G8 are green — it remains only as the fallback until then.
+## What changed from the first plan (honest record)
+The first plan assumed the holospace might expose a host process surface that would let the guest be *dropped
+entirely* once the agent ran native. It does not — threads/processes live only in the guest. So the guest is not
+retired; it becomes the **agent substrate** in a per-transport split, with native-exec accelerating the
+dashboard. The interpreter wall is removed for the read-heavy common case, kept (in the guest) only for the
+inherently-threaded agent — which is where the substrate's real OS genuinely earns its cost.

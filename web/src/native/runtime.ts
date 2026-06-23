@@ -16,8 +16,13 @@ export interface PyodideLike {
   runPython(code: string): unknown;
   runPythonAsync(code: string): Promise<unknown>;
   unpackArchive(buffer: ArrayBuffer | Uint8Array, format: string, options?: { extractDir?: string }): void;
+  globals: { set(name: string, value: unknown): void };
   FS: { mkdirTree(path: string): void };
 }
+
+/** A native-WS lifecycle event the in-process ASGI driver pushes to the worker (which maps it onto the
+ *  holo-protocol wsopened/wsmsg/wsclosed/wserr frames). `kind`: accept | message | close | error. */
+export type SocketEvent = { sid: number; kind: "accept" | "message" | "close" | "error"; data: string; code: number };
 
 /** The holospace OS surface (process/fs/net) the agent's shell tools route to — optional; null for the
  *  dashboard path (no subprocess). Wired at G5. */
@@ -36,6 +41,15 @@ export interface NativeBackend {
   request(method: string, path: string, headers?: Record<string, string>, body?: Uint8Array | null): Promise<NativeResponse>;
   /** The frozen in-app session token (for the dashboard's authenticated calls). */
   token: string;
+  /** Open a real WebSocket against the in-process ASGI app (the path the dashboard's chat __HOLO_WS__ takes).
+   *  Returns the native sid; lifecycle events arrive via {@link onSocketEvent}. */
+  openSocket(path: string): number;
+  /** Deliver a client text frame into the ASGI app's receive channel for this socket. */
+  sendSocket(sid: number, text: string): void;
+  /** Close the client side of this socket (ASGI websocket.disconnect). */
+  closeSocket(sid: number): void;
+  /** Register the single sink the ASGI WS driver pushes accept/message/close/error events to. */
+  onSocketEvent(cb: (e: SocketEvent) => void): void;
 }
 
 export async function bootNativeBackend(
@@ -88,10 +102,121 @@ async def _native_request(method, path, headers, body):
 `);
   log("app imported");
 
+  // 6. In-process ASGI WebSocket driver — the WS analogue of the httpx ASGITransport above (httpx does NOT
+  //    speak WebSocket). It drives the app's `websocket` scope directly: a per-socket asyncio receive queue +
+  //    a send callback that pushes accept/send/close back out through ONE JS sink. This serves the REAL
+  //    /api/ws gateway (tui_gateway.handle_ws) in-process — no PTY, no subprocess. The synthetic scope sets a
+  //    loopback client + Host so the dashboard's WS Host/Origin + peer guards accept it (native leaves
+  //    app.state unset → loopback/`?token=` auth, which the client already appends).
+  py.runPython(`
+import asyncio as _aio
+from urllib.parse import urlsplit as _urlsplit
+
+_native_ws = {}
+_native_ws_seq = [0]
+
+def _native_ws_emit(sid, kind, text="", code=0):
+    cb = globals().get("_native_ws_sink")
+    if cb is not None:
+        cb(sid, kind, text, code)
+
+class _NativeWS:
+    def __init__(self, sid, path):
+        self._sid = sid
+        self._q = _aio.Queue()
+        self._done = False
+        u = _urlsplit(path)
+        self._scope = {
+            "type": "websocket",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "scheme": "ws",
+            "path": u.path,
+            "raw_path": u.path.encode("utf-8"),
+            "query_string": u.query.encode("utf-8"),
+            "root_path": "",
+            "headers": [(b"host", b"app")],
+            "client": ("127.0.0.1", 0),
+            "server": ("app", 80),
+            "subprotocols": [],
+            "state": {},
+        }
+        self._q.put_nowait({"type": "websocket.connect"})
+        self._task = _aio.ensure_future(self._run())
+
+    async def _receive(self):
+        return await self._q.get()
+
+    async def _send(self, event):
+        t = event.get("type")
+        if t == "websocket.accept":
+            _native_ws_emit(self._sid, "accept")
+        elif t == "websocket.send":
+            txt = event.get("text")
+            if txt is None and event.get("bytes") is not None:
+                txt = bytes(event["bytes"]).decode("utf-8", "replace")
+            if txt is not None:
+                _native_ws_emit(self._sid, "message", txt)
+        elif t == "websocket.close":
+            self._finish(int(event.get("code", 1000)), str(event.get("reason") or ""))
+
+    def _finish(self, code, reason):
+        if self._done:
+            return
+        self._done = True
+        _native_ws_emit(self._sid, "close", reason, code)
+
+    async def _run(self):
+        try:
+            await _ws.app(self._scope, self._receive, self._send)
+        except Exception as exc:
+            if not self._done:
+                self._done = True
+                import traceback as _tb
+                _native_ws_emit(self._sid, "error", f"{exc!r}\\n{_tb.format_exc()}")
+        else:
+            self._finish(1000, "")
+
+    def client_send(self, text):
+        if not self._done:
+            self._q.put_nowait({"type": "websocket.receive", "text": text})
+
+    def client_close(self):
+        if not self._done:
+            self._q.put_nowait({"type": "websocket.disconnect", "code": 1000})
+
+def _native_ws_open(path):
+    _native_ws_seq[0] += 1
+    sid = _native_ws_seq[0]
+    _native_ws[sid] = _NativeWS(sid, path)
+    return sid
+
+def _native_ws_send(sid, text):
+    s = _native_ws.get(sid)
+    if s is not None:
+        s.client_send(text)
+
+def _native_ws_close(sid):
+    s = _native_ws.pop(sid, None)
+    if s is not None:
+        s.client_close()
+`);
+  log("ws driver installed");
+
   const token = py.runPython(`_ws._SESSION_TOKEN`) as string;
   const requestFn = py.runPython(`_native_request`) as (
     m: string, p: string, h: [string, string][], b: Uint8Array | null,
   ) => Promise<{ toJs(): [number, [string, string][], Uint8Array]; destroy(): void }>;
+  const wsOpenFn = py.runPython(`_native_ws_open`) as (path: string) => number;
+  const wsSendFn = py.runPython(`_native_ws_send`) as (sid: number, text: string) => void;
+  const wsCloseFn = py.runPython(`_native_ws_close`) as (sid: number) => void;
+
+  // ONE long-lived sink the Python WS driver pushes events to (kept alive via globals.set, never destroyed —
+  // backend lifetime = page lifetime). The worker registers its dispatcher through onSocketEvent.
+  let socketSink: ((e: SocketEvent) => void) | null = null;
+  py.globals.set("_native_ws_sink", (sid: number, kind: SocketEvent["kind"], data: string, code: number) => {
+    socketSink?.({ sid, kind, data: data ?? "", code: code ?? 0 });
+  });
 
   return {
     token,
@@ -103,6 +228,10 @@ async def _native_request(method, path, headers, body):
       proxy.destroy?.();
       return { status, headers: hdrs, body: b instanceof Uint8Array ? b : new Uint8Array(b) };
     },
+    openSocket(path) { return wsOpenFn(path); },
+    sendSocket(sid, text) { wsSendFn(sid, text); },
+    closeSocket(sid) { wsCloseFn(sid); },
+    onSocketEvent(cb) { socketSink = cb; },
   };
 }
 
