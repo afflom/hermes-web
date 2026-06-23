@@ -49,6 +49,8 @@ const mockSrv = createServer((req, res) => {
 });
 
 const log = (...a) => console.log("[xverify]", ...a);
+// Watchdog so a stuck browser/extension can never hang CI.
+const watchdog = setTimeout(() => { log("OVERALL TIMEOUT — FAIL"); process.exit(1); }, 220000);
 let ctx;
 try {
   await new Promise((r) => pageSrv.listen(PAGE_PORT, r));
@@ -117,6 +119,7 @@ try {
   log("ERROR", String(e).split("\n").slice(0, 4).join(" | "));
   process.exitCode = 1;
 } finally {
+  clearTimeout(watchdog);
   await ctx?.close();
   pageSrv.close(); mockSrv.close();
 }

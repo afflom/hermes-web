@@ -74,6 +74,17 @@ jobs:
           npx playwright test deployment.spec.ts features.spec.ts
         working-directory: e2e
 
+      - name: Native-exec gate (all-native dashboard + threaded gateway + chat — FAIL-CLOSED)
+        # ?native=1 runs the WHOLE backend native in one Pyodide worker (no emulator): the dashboard serves
+        # /api native, the threaded tui_gateway handshakes + dispatches, and a full chat turn streams the LLM
+        # reply over the egress. Then the cross-origin harness proves the real-provider path — the page's own
+        # fetch to a cross-origin model is CORS-blocked, yet chat works THROUGH the router extension's CORS-free
+        # fetch (the established egress). If the native agent or its egress breaks, the deploy is blocked.
+        run: |
+          npx playwright test native-chat.spec.ts
+          node verify-xorigin.mjs
+        working-directory: e2e
+
       - name: Upload Playwright report on failure
         if: failure()
         uses: actions/upload-artifact@v4
