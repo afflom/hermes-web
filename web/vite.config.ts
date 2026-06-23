@@ -4,6 +4,20 @@ import tailwindcss from "@tailwindcss/vite";
 import path from "path";
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+
+// Build the native-exec backend bundle (the real Hermes Python + dep manifest from pyproject + the OS-surface
+// adapter) into public/native/ so the production build ships it for the native worker to fetch. DRY: one build
+// step, derived from the repo source — never a hand-maintained copy.
+function hermesNativeBundle(): Plugin {
+  return {
+    name: "hermes:native-bundle",
+    apply: "build",
+    buildStart() {
+      execFileSync("node", [path.resolve(__dirname, "scripts/bundle-hermes-native.mjs")], { stdio: "inherit" });
+    },
+  };
+}
 
 const BACKEND = process.env.HERMES_DASHBOARD_URL ?? "http://127.0.0.1:9119";
 
@@ -97,7 +111,7 @@ export default defineConfig({
     // Content hash of the holospaces wasm + glue, for cache-busting their stable-URL load in the worker.
     __HOLO_ASSET_VER__: JSON.stringify(holoAssetVer()),
   },
-  plugins: [react(), tailwindcss(), hermesDevToken()],
+  plugins: [react(), tailwindcss(), hermesDevToken(), hermesNativeBundle()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

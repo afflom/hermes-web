@@ -131,7 +131,14 @@ export async function bootWorkerTransport(report: (p: HologramBootProgress) => v
     w.__HOLO_BOOT_ELAPSED__ = ((Date.now() - t0) / 1000).toFixed(1);
     report(p);
   };
-  worker = new Worker(new URL("./holo-worker.ts", import.meta.url), { type: "module", name: "holospaces" });
+  // Backend selection (DRY — same protocol either way): the native-exec worker runs the REAL Hermes Python on
+  // the browser peer's JS engine (Pyodide, hologram-native); the emulated worker resumes the warm-κ guest. The
+  // native path is opt-in (?native=1) during the G3–G8 transition; it becomes the default once those gates are
+  // green and the emulated κ path is retired (PLAN.md, no prototype back-compat).
+  const native = typeof location !== "undefined" && new URLSearchParams(location.search).get("native") === "1";
+  worker = native
+    ? new Worker(new URL("../native/worker.ts", import.meta.url), { type: "module", name: "hermes-native" })
+    : new Worker(new URL("./holo-worker.ts", import.meta.url), { type: "module", name: "holospaces" });
 
   // Wire the agent's egress to the router extension if present (relay worker <-> extension).
   const extId = await awaitEgressExtensionId(1200);
