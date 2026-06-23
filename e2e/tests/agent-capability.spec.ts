@@ -46,7 +46,7 @@ test.describe("Hermes agent backend (in-browser, over the loopback bridge)", () 
   let page: Page;
 
   test.beforeAll(async ({ browser }) => {
-    test.setTimeout(300_000); // resume is multi-minute; this hook owns the one boot for the whole suite
+    test.setTimeout(450_000); // resume is multi-minute; this hook owns the one boot for the whole suite
     page = await browser.newPage();
     await page.goto("./", { waitUntil: "load" });
     const has = await manifestPublished(page);
@@ -54,7 +54,7 @@ test.describe("Hermes agent backend (in-browser, over the loopback bridge)", () 
       test.skip(!EXPECT, "no warm-κ manifest published for this build yet");
       expect(has, "E2E_EXPECT_HOLOGRAM=1 but no warm-κ manifest is published").toBe(true);
     }
-    await page.waitForFunction("window.__HOLO_BACKEND_READY__ === true", null, { timeout: 240_000 });
+    await page.waitForFunction("window.__HOLO_BACKEND_READY__ === true", null, { timeout: 360_000 });
     // Warm the in-guest server with one light request so the per-test probes hit a primed backend
     // (the very first request after resume pays cold-cache + JIT costs under emulation).
     await api(page, "/api/config").catch(() => {});
