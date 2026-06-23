@@ -24,10 +24,14 @@ export interface PyodideLike {
  *  holo-protocol wsopened/wsmsg/wsclosed/wserr frames). `kind`: accept | message | close | error. */
 export type SocketEvent = { sid: number; kind: "accept" | "message" | "close" | "error"; data: string; code: number };
 
-/** The holospace OS surface (process/fs/net) the agent's shell tools route to — optional; null for the
- *  dashboard path (no subprocess). Wired at G5. */
+/** The host surface the agent's OS calls route to — optional; null for the dashboard-only path.
+ *  `fetch` is the egress bridge for the agent's outbound HTTPS (the LLM call): it performs the request in the
+ *  browser (the extension's CORS-free fetch does DNS+TLS+HTTP, since Pyodide has no ssl) and returns
+ *  `[status, headers, body]`. In-browser it returns a Promise (bridged sync with run_sync); a node gate may
+ *  pass a synchronous stand-in. `exec` (process surface) is not wired — threads/processes live in the guest. */
 export interface NativeHost {
   exec?: unknown;
+  fetch?: (method: string, url: string, headers: [string, string][], body: Uint8Array) => unknown;
 }
 
 export interface NativeResponse {
@@ -54,7 +58,15 @@ export interface NativeBackend {
 
 export async function bootNativeBackend(
   py: PyodideLike,
-  opts: { manifest: NativeManifest; sourceTar: Uint8Array; osSurfacePy: string; host?: NativeHost | null; log?: (m: string) => void },
+  opts: {
+    manifest: NativeManifest;
+    sourceTar: Uint8Array;
+    osSurfacePy: string;
+    /** The network surface (CC-16 socket + the HTTP fetch egress for the LLM call). Omit for dashboard-only. */
+    osNetPy?: string;
+    host?: NativeHost | null;
+    log?: (m: string) => void;
+  },
 ): Promise<NativeBackend> {
   const log = opts.log ?? (() => {});
 
@@ -202,6 +214,29 @@ def _native_ws_close(sid):
         s.client_close()
 `);
   log("ws driver installed");
+
+  // 7. Network surface — ship os_net and route the agent's outbound HTTPS through the egress bridge. Pyodide
+  //    has no ssl, so the BROWSER does TLS via host.fetch (the extension's CORS-free fetch). One httpx patch
+  //    covers every model SDK. host.fetch returns a Promise in-browser (bridged sync with run_sync) or a plain
+  //    [status, headers, body] from a node gate.
+  if (opts.osNetPy && opts.host?.fetch) {
+    py.globals.set("_holo_http_fetch", opts.host.fetch);
+    py.runPython(
+      `import os\nopen("/native/os_net.py","w").write(${q(opts.osNetPy)})\n` +
+        `import os_net as _osnet\n` +
+        `def _egress_fetch(method, url, headers, body):\n` +
+        `    res = _holo_http_fetch(method, url, headers, bytes(body))\n` +
+        `    if hasattr(res, "then"):\n` +  // a JS Promise (browser) → suspend the wasm stack until it resolves
+        `        from pyodide.ffi import run_sync\n` +
+        `        res = run_sync(res)\n` +
+        `    arr = res.to_py() if hasattr(res, "to_py") else res\n` +
+        `    status, hdrs, rbody = arr[0], arr[1], arr[2]\n` +
+        `    hdrs = [list(h) for h in (hdrs.to_py() if hasattr(hdrs, "to_py") else hdrs)]\n` +
+        `    return int(status), hdrs, bytes(rbody.to_py() if hasattr(rbody, "to_py") else rbody)\n` +
+        `_osnet.install_http_egress(_egress_fetch)`,
+    );
+    log("http egress installed");
+  }
 
   const token = py.runPython(`_ws._SESSION_TOKEN`) as string;
   const requestFn = py.runPython(`_native_request`) as (

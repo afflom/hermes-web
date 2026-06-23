@@ -65,8 +65,10 @@ const manifest = {
 };
 writeFileSync(path.join(OUT, "deps.json"), JSON.stringify(manifest, null, 2) + "\n");
 
-// Ship the OS-surface adapter alongside (the worker fetches it; the gate reads it from src) — ONE source file.
+// Ship the OS-surface adapters alongside (the worker fetches them; the gate reads them from src). os_surface =
+// threads + OS modules; os_net = the network surface (CC-16 socket + the HTTP fetch egress for the LLM call).
 execFileSync("cp", [path.join(REPO, "web/src/native/os_surface.py"), path.join(OUT, "os_surface.py")]);
+execFileSync("cp", [path.join(REPO, "web/src/native/os_net.py"), path.join(OUT, "os_net.py")]);
 
 const mb = (p) => (statSync(p).size / 1e6).toFixed(1);
 console.log(`[bundle] hermes-src.tar: ${mb(TAR)} MB (${SRC.length} source roots)`);
