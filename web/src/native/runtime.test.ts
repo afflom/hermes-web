@@ -218,26 +218,23 @@ json.dumps({"status": r.status_code, "json": r.json(), "calls": calls})
     expect(JSON.parse(r.calls[0].body).model).toBe("claude"); // the request body reached the egress
   });
 
-  // G6: THE CAPSTONE — a full chat turn runs NATIVE end-to-end. The cooperative thread surface runs the agent
-  // build + the turn inline; the LLM call rides the HTTP egress to a mock chat.completions model.
-  // STATUS: the turn progresses NATIVE through gateway.ready → session.create (model resolved from config) →
-  // prompt.submit → agent build → the LLM call — but then HANGS: a concurrency pattern in run_conversation
-  // (a blocking Event.wait / a thread meant to run *alongside* the main flow, not before it) deadlocks the
-  // single thread, which the inline cooperative model can't carry (it serializes what must overlap). Dispatch
-  // (G5b session.list) proves the surface; the turn's OVERLAPPING concurrency is the next frontier — it needs
-  // the thread surface to drive truly-concurrent threads cooperatively (yield at blocking points), not inline.
-  // Skipped so it can't wedge the single-threaded runtime / block CI until that lands.
-  it.skip("G6: a full chat turn runs NATIVE (build + LLM via egress → assistant reply)", async () => {
+  // G6: THE CAPSTONE — a full chat turn runs NATIVE end-to-end, no emulator. The cooperative thread surface
+  // runs the agent build + the turn on the single thread (background poll loops — the notification poller's
+  // queue.get, the reaper's wait — unwind at their Condition.wait); the streaming LLM call rides the HTTP
+  // egress to a mock chat.completions (SSE) model. This proves the WHOLE native agent: gateway dispatch →
+  // agent build → streaming LLM call via egress → streamed assistant reply. In the browser the same path runs
+  // with run_sync over the extension's CORS-free fetch (JSPI present).
+  it("G6: a full chat turn runs NATIVE (build + LLM via egress → assistant reply)", async () => {
     const osNetPy = readFileSync(path.join(REPO, "web/src/native/os_net.py"), "utf8");
     const REPLY = "native-turn-ok-7f3a";
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     py.globals.set("_mock_fetch", (_m: string, _u: string, _h: unknown, _b: Uint8Array) => {
-      const body = JSON.stringify({
-        id: "chatcmpl-mock", object: "chat.completion", model: "custom/mock",
-        choices: [{ index: 0, message: { role: "assistant", content: REPLY }, finish_reason: "stop" }],
-        usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
-      });
-      return [200, [["content-type", "application/json"]], new TextEncoder().encode(body)];
+      // The agent uses STREAMING chat.completions, so the mock returns Server-Sent Events (delta chunks + [DONE]).
+      const sse =
+        `data: {"id":"mock","object":"chat.completion.chunk","model":"custom/mock","choices":[{"index":0,"delta":{"role":"assistant","content":${JSON.stringify(REPLY)}},"finish_reason":null}]}\n\n` +
+        `data: {"id":"mock","object":"chat.completion.chunk","model":"custom/mock","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n` +
+        `data: [DONE]\n\n`;
+      return [200, [["content-type", "text/event-stream"]], new TextEncoder().encode(sse)];
     });
     py.runPython(`
 import os

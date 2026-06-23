@@ -114,6 +114,21 @@ def _install_thread_surface() -> None:
     threading.Thread = _CoopThread
     threading.Timer = _CoopTimer
 
+    # Background poll/reaper loops block on a CONDITION with a timeout — `Event.wait(t)`, `queue.get(timeout=t)`,
+    # `Condition.wait(t)` all route through threading.Condition.wait. Inside a cooperatively-run thread, ANY such
+    # blocking wait is a background poll loop (the single page session never has a second thread to satisfy it),
+    # so unwind it. The non-blocking probe `wait(0)` (used by Event.is_set / queue-empty fast paths) stays real,
+    # and a real handoff whose producer already ran inline finds its predicate true and never reaches the wait.
+    _Condition = threading.Condition
+    _real_cond_wait = _Condition.wait
+
+    def _coop_cond_wait(self, timeout=None):
+        if getattr(_local, "depth", 0) and timeout != 0:
+            raise _CoopYield()  # a blocking wait in a coop thread = a background poll loop → exit it cleanly
+        return _real_cond_wait(self, timeout)
+
+    _Condition.wait = _coop_cond_wait
+
     async def _coop_to_thread(func, /, *args, **kwargs):  # no thread pool to offload to — run inline
         return func(*args, **kwargs)
 
