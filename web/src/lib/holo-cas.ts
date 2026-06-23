@@ -14,7 +14,6 @@
 // `cargo run --example kappa_of` records). Equal load order, equal bytes, equal κ.
 
 import { blake3 } from "@noble/hashes/blake3.js";
-import { ungzip } from "pako";
 
 export interface WarmManifest {
   /** The substrate κ-label of the whole snapshot (`blake3:<hex>`) — the only trust anchor. */
@@ -154,15 +153,43 @@ export async function loadWarmChunks(onProgress: OnProgress = () => {}): Promise
   // Keep the COMPRESSED chunks (~390 MB) — NOT the 1.9 GB of decompressed bytes. Each is decompressed once
   // here only to feed the incremental κ verify, then the raw is dropped; the caller re-inflates on-demand
   // during the feed (one chunk at a time). So the JS side never holds the whole snapshot → ~1.9 GB peak.
+  // Fetch the chunks CONCURRENTLY (a bounded pool), but verify them STRICTLY IN ORDER: the κ is the blake3 of
+  // the concatenated raw snapshot, so `hasher.update` must see chunks 0..N in sequence — only the network
+  // fetch parallelizes. Serial fetch was the dominant boot cost (~3.5 s × N chunks ≈ 85 s on a CDN that never
+  // saturates one connection); a 6-wide pool overlaps that into ~the decompress-bound floor. Memory is
+  // unchanged: the in-order verify decompresses ONE chunk at a time (raw GC'd after `update`); the kept
+  // compressed array (~390 MB) is exactly the serial path's footprint.
+  const N = manifest.chunks.length;
+  const POOL = Math.min(6, N); // browsers cap ~6 connections/host; more would just queue
+  const ready: Promise<Uint8Array>[] = [];
+  const resolve: ((b: Uint8Array) => void)[] = [];
+  for (let i = 0; i < N; i++) ready.push(new Promise<Uint8Array>((r) => (resolve[i] = r)));
+  let dispatch = 0;
+  let fetched = 0;
+  const pump = async (): Promise<void> => {
+    for (let i = dispatch++; i < N; i = dispatch++) {
+      const c = manifest.chunks[i];
+      const cr = await fetch(`${warmUrl(`chunks/${c.name}`)}?v=${ver}`, { cache: "force-cache" });
+      if (!cr.ok) throw new Error(`warm-κ chunk ${c.name} fetch failed (${cr.status})`);
+      const comp = new Uint8Array(await cr.arrayBuffer());
+      onProgress({ phase: "chunk", fraction: ++fetched / N, detail: `fetching warm machine ${fetched}/${N}` });
+      resolve[i](comp);
+    }
+  };
+  // A pump rejection (a failed fetch) must surface even while we await a different chunk in order, so race the
+  // in-order wait against a guard that only ever rejects (resolves → hangs, letting the real chunk win).
+  const guard: Promise<never> = Promise.all(Array.from({ length: POOL }, pump)).then(
+    () => new Promise<never>(() => {}),
+    (e) => Promise.reject(e),
+  );
   const gz: (Uint8Array | null)[] = [];
-  for (let i = 0; i < manifest.chunks.length; i++) {
-    const c = manifest.chunks[i];
-    onProgress({ phase: "chunk", fraction: i / manifest.chunks.length, detail: `fetching warm machine ${i + 1}/${manifest.chunks.length}` });
-    const cr = await fetch(`${warmUrl(`chunks/${c.name}`)}?v=${ver}`, { cache: "force-cache" });
-    if (!cr.ok) throw new Error(`warm-κ chunk ${c.name} fetch failed (${cr.status})`);
-    const comp = new Uint8Array(await cr.arrayBuffer());
-    const raw = manifest.chunkGzip ? ungzip(comp) : comp; // decompress to VERIFY only; raw is GC'd after update
-    if (raw.length !== c.size) throw new Error(`warm-κ chunk ${c.name} size mismatch`);
+  for (let i = 0; i < N; i++) {
+    const comp = await Promise.race([ready[i], guard]);
+    // Decompress to VERIFY only (raw GC'd after `update`). Native DecompressionStream (~150 MB/s) instead of
+    // pako's JS inflate (~16 MB/s) — on a fast connection (or localhost) this CPU cost, not the network, was
+    // the dominant boot term: ~1.3 GB inflated ≈ 80 s with pako vs ~9 s native.
+    const raw = manifest.chunkGzip ? await gunzipInto(comp, manifest.chunks[i].size) : comp;
+    if (raw.length !== manifest.chunks[i].size) throw new Error(`warm-κ chunk ${manifest.chunks[i].name} size mismatch`);
     hasher.update(raw); // incremental Law-L5 verify — no whole-snapshot materialization
     gz.push(manifest.chunkGzip ? comp : raw);
   }
