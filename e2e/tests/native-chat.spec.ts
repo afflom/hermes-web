@@ -67,15 +67,13 @@ test("all-native: ?native=1 serves the dashboard AND the threaded agent gateway 
   expect(body, "dashboard not in an error state").not.toMatch(/failed to load|error loading|backend unavailable/i);
 });
 
-// The capstone, in the BROWSER: a full chat turn runs all-native — agent build + the STREAMING LLM call, whose
-// sync httpx is bridged to the async fetch egress by run_sync (JSPI). Node proves the WHOLE logic with a sync
-// fake (9/9). The egress itself is verified working in-browser too (the agent's outbound requests — provider
-// discovery + the chat POST — all go out over httpfetch). BLOCKED, documented: run_sync does not SUSPEND in the
-// deep live agent context (ASGI app → handle_ws → dispatch → nested cooperative threads → run_sync), though it
-// suspends in every isolation test (incl. via the to_thread shim). So the egress RESPONSES arrive after the turn
-// instead of during it, and no reply streams. Skipped until the run_sync-suspension context is resolved (the
-// last piece for native chat); the guest default serves full chat meanwhile.
-test.fixme("all-native: a full chat turn runs native in the browser (LLM via egress + run_sync)", async ({ page }) => {
+// THE CAPSTONE, in the BROWSER: a full chat turn runs ALL-NATIVE end to end — agent build + the STREAMING LLM
+// call, whose sync httpx is bridged to the async fetch egress by run_sync (JSPI suspends the wasm stack so the
+// worker pumps the established egress, then resumes). The agent reaches a same-origin mock model (provider
+// discovery + chat.completions SSE) over the egress; the streamed assistant reply comes back. With the gateway
+// gate above + the node gate (9/9), the WHOLE native agent — dashboard, threaded gateway, and chat — is
+// browser-verified with no emulator.
+test("all-native: a full chat turn runs native in the browser (LLM via egress + run_sync)", async ({ page }) => {
   test.setTimeout(180_000);
   page.on("console", (m) => console.log(`[browser:${m.type()}] ${m.text()}`));
   page.on("pageerror", (e) => console.log(`[browser:pageerror] ${e.message}`));
@@ -105,9 +103,8 @@ test.fixme("all-native: a full chat turn runs native in the browser (LLM via egr
         ws.addEventListener("message", (ev) => {
           const data = typeof ev.data === "string" ? ev.data : "";
           if (data.includes("native-browser-turn-ok-3b9f")) { clearTimeout(timer); ws.close(); resolve(data); return; }
-          let m: { params?: { type?: string; payload?: { message?: string } }; id?: number; result?: { session_id?: string; id?: string } };
+          let m: { params?: { type?: string }; id?: number; result?: { session_id?: string; id?: string } };
           try { m = JSON.parse(data); } catch { return; }
-          if (m.params?.type === "error" || m.params?.type === "message.end") console.log(`[WSEVT] ${m.params.type} ${JSON.stringify(m.params.payload ?? "")}`);
           if (m.params?.type === "gateway.ready") {
             ws.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "session.create", params: { title: "browser-turn" } }));
           } else if (m.id === 1 && m.result) {

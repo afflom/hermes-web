@@ -229,10 +229,13 @@ def _native_ws_close(sid):
     py.runPython(
       `import os\nopen("/native/os_net.py","w").write(${q(opts.osNetPy)})\n` +
         `import os_net as _osnet\n` +
+        `from pyodide.ffi import to_js, run_sync\n` +
         `def _egress_fetch(method, url, headers, body):\n` +
-        `    res = _holo_http_fetch(method, url, headers, bytes(body))\n` +
+        // Convert the args to JS-native types: headers (a Python list) + body (bytes) cross to the worker via
+        // postMessage (host.fetch → the main thread), which can only structured-clone plain JS values — a raw
+        // PyProxy throws DataCloneError. method/url are str (already JS strings).
+        `    res = _holo_http_fetch(method, url, to_js(headers), to_js(bytes(body)))\n` +
         `    if hasattr(res, "then"):\n` +  // a JS Promise (browser) → suspend the wasm stack until it resolves
-        `        from pyodide.ffi import run_sync\n` +
         `        res = run_sync(res)\n` +
         `    arr = res.to_py() if hasattr(res, "to_py") else res\n` +
         `    status, hdrs, rbody = arr[0], arr[1], arr[2]\n` +
