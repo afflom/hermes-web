@@ -56,30 +56,51 @@ describe("native-exec Hermes backend", () => {
     await backend.request("DELETE", `/api/cron/jobs/${id}?profile=default`, auth);
   });
 
-  // G5a: the in-process ASGI WebSocket driver is the WS analogue of the httpx HTTP path. It DRIVES the real
-  // /api/ws route (the actual tui_gateway, no PTY) — proving the driver is wired correctly. But the gateway is
-  // fundamentally THREADED: importing tui_gateway.server spawns a daemon reaper thread, and Pyodide has no
-  // pthreads, so the native attempt fails with "can't start new thread". The driver must surface that as a clean
-  // ERROR EVENT (never a hang). This is exactly WHY the chat/agent WS routes to the emulated guest (which has
-  // real threads) while the dashboard stays native — the holospaces per-transport split (PLAN.md G5).
-  it("G5a: the ASGI WS driver drives real /api/ws + surfaces the threading boundary cleanly (→ guest)", async () => {
+  // G5a: the chat transport, NATIVE. /api/ws is the real tui_gateway WebSocket — and the gateway is threaded
+  // (it spawns a daemon reaper at import, offloads dispatch via asyncio.to_thread, etc.). The cooperative thread
+  // surface (os_surface) backs those OS threads on the single-threaded event loop, so the REAL gateway imports
+  // and serves NATIVELY — no emulator, no >360 s establishment. The driver must accept the upgrade and emit the
+  // gateway.ready handshake. This is the hologram/holospaces bottleneck elimination: the agent transport runs
+  // native, not behind the interpreter wall.
+  it("G5a: real /api/ws imports + serves gateway.ready NATIVE (cooperative thread surface, no emulator)", async () => {
     const events: { kind: string; data: string }[] = [];
-    const settled = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`WS driver hung (no event in 15s); events=${JSON.stringify(events)}`)), 15_000);
+    const ready = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`no gateway.ready in 20s; events=${JSON.stringify(events)}`)), 20_000);
       backend.onSocketEvent((e) => {
         events.push({ kind: e.kind, data: e.data });
-        if (e.kind === "error" || (e.kind === "message" && e.data.includes("gateway.ready"))) {
-          clearTimeout(timer);
-          resolve();
-        }
+        if (e.kind === "error") { clearTimeout(timer); reject(new Error(`ws error: ${e.data}`)); }
+        if (e.kind === "message" && e.data.includes("gateway.ready")) { clearTimeout(timer); resolve(); }
       });
     });
     const sid = backend.openSocket(`/api/ws?token=${backend.token}`);
-    await settled; // resolves on a clean event — the point is it does NOT hang
-    const err = events.find((e) => e.kind === "error");
-    // The threaded gateway can't boot under single-threaded Pyodide → confirmed boundary that routes chat to the
-    // guest. (If a future pthread substrate lands, this asserts the driver still drives the real route.)
-    expect(err?.data, "native /api/ws surfaces the thread boundary (not a hang)").toMatch(/can't start new thread/);
+    await ready;
+    expect(events.some((e) => e.kind === "accept"), "upgrade accepted natively").toBe(true);
+    const msg = events.find((e) => e.kind === "message")!;
+    expect(JSON.parse(msg.data).params.type, "first frame is gateway.ready, served native").toBe("gateway.ready");
+    backend.closeSocket(sid);
+  });
+
+  // G5b: a real JSON-RPC dispatch round-trips NATIVE — beyond the handshake into server.dispatch, which the
+  // gateway runs via asyncio.to_thread and which itself synchronizes on threading.Event/Lock. A well-formed
+  // response (result or error) with the matching id proves the cooperative thread surface carries the gateway's
+  // dispatch path on the single thread, native — the deep proof the threaded agent can run without the emulator.
+  it("G5b: a real JSON-RPC dispatch round-trips NATIVE over /api/ws (session.list)", async () => {
+    let sid = 0;
+    const got = new Promise<{ id?: number; result?: unknown; error?: unknown }>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("no JSON-RPC response in 25s")), 25_000);
+      backend.onSocketEvent((e) => {
+        if (e.kind === "error") { clearTimeout(timer); reject(new Error(`ws error: ${e.data}`)); return; }
+        if (e.kind !== "message") return;
+        const m = JSON.parse(e.data);
+        if (m.params?.type === "gateway.ready") {
+          backend.sendSocket(sid, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "session.list", params: {} }));
+        } else if (m.id === 1) { clearTimeout(timer); resolve(m); }
+      });
+    });
+    sid = backend.openSocket(`/api/ws?token=${backend.token}`);
+    const resp = await got;
+    expect(resp.id, "the dispatch reply carries our request id").toBe(1);
+    expect(resp.result !== undefined || resp.error !== undefined, "a well-formed JSON-RPC reply (dispatch ran)").toBe(true);
     backend.closeSocket(sid);
   });
 });
