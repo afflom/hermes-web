@@ -64,3 +64,80 @@ def ipv4_of(host: str) -> tuple[int, int, int, int] | None:
     if all(0 <= o <= 255 for o in octets):
         return octets  # type: ignore[return-value]
     return None
+
+
+class WouldBlock(Exception):
+    """No buffered data and no blocking pump — raised only in the synchronous (test) path."""
+
+
+class EgressSocket:
+    """A blocking TCP socket backed by CC-16 egress frames — one connection id per socket.
+
+    ``emit(frame)`` hands an outbound frame to the egress channel (worker → main-thread relay → extension).
+    ``feed(frame)`` is called with each inbound frame from that channel. The blocking points (connect, recv)
+    call ``block()`` to wait for the next inbound frame; in-browser that is a ``pyodide.ffi.run_sync`` that
+    suspends the wasm stack so the worker loop can deliver it (JSPI), then resumes. With ssl wrapped over this,
+    Python's http + the model SDKs run unchanged on top.
+    """
+
+    def __init__(self, cid: int, emit, block=None) -> None:
+        self._cid = cid
+        self._emit = emit
+        self._block = block
+        self._rx = bytearray()
+        self._state = "init"  # init → opening → open → closed/error
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    def connect(self, host: str, port: int) -> None:
+        ip = ipv4_of(host)
+        if ip is None:
+            raise OSError(f"egress connect needs a resolved IPv4 (got name {host!r} — DNS resolves separately)")
+        self._state = "opening"
+        self._emit(encode_open(self._cid, ip, port))
+        while self._state == "opening":
+            self._pump()
+        if self._state != "open":
+            raise OSError(f"egress connect to {host}:{port} failed ({self._state})")
+
+    def feed(self, frame: bytes) -> None:
+        op, cid, body = parse_frame(frame)
+        if cid != self._cid:
+            return
+        if op == OP_OPENED:
+            self._state = "open"
+        elif op == OP_RDATA:
+            self._rx += body
+        elif op == OP_CLOSED:
+            self._state = "closed"
+        elif op == OP_FAILED:
+            self._state = "error"
+
+    def send(self, data: bytes) -> int:
+        if self._state != "open":
+            raise OSError(f"send on a non-open egress socket ({self._state})")
+        self._emit(encode_data(self._cid, bytes(data)))
+        return len(data)
+
+    sendall = send
+
+    def recv(self, bufsize: int) -> bytes:
+        while not self._rx and self._state == "open":
+            self._pump()
+        if self._rx:
+            chunk = bytes(self._rx[:bufsize])
+            del self._rx[:bufsize]
+            return chunk
+        return b""  # peer closed → EOF
+
+    def close(self) -> None:
+        if self._state in ("opening", "open"):
+            self._emit(encode_close(self._cid))
+        self._state = "closed"
+
+    def _pump(self) -> None:
+        if self._block is None:
+            raise WouldBlock("no blocking pump installed (in-browser this is run_sync) and no buffered frame")
+        self._block()

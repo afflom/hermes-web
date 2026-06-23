@@ -137,4 +137,52 @@ json.dumps({
     expect(r.ipv4_name).toBeNull(); // a hostname needs DNS (resolved separately), not a dotted-quad
     expect(r.ipv4_dotted).toEqual([127, 0, 0, 1]);
   });
+
+  // G6-socket: the egress-backed socket state machine — connect→OPEN(+wait OPENED), send→DATA, recv←RDATA,
+  // peer CLOSED→EOF — over the CC-16 frames. The in-browser blocking pump is run_sync (JSPI); here a
+  // queue-driven pump delivers the inbound frames synchronously so the connection logic is gated node-side.
+  it("G6: EgressSocket drives a CC-16 connection (connect → send → recv → close)", () => {
+    const out = py.runPython(`
+import types, json
+_m = types.ModuleType("os_net"); exec(${JSON.stringify(readFileSync(path.join(REPO, "web/src/native/os_net.py"), "utf8"))}, _m.__dict__)
+
+def mk(cid):
+    sent = []; inbox = []
+    s = _m.EgressSocket(cid, lambda f: sent.append(list(f)))
+    s._block = lambda: s.feed(bytes(inbox.pop(0)))  # run_sync's role in the browser: deliver the next frame
+    return s, sent, inbox
+
+# A — happy path: connect→OPEN(+OPENED), send→DATA, recv←RDATA, then WE close→CLOSE.
+a, a_sent, a_inbox = mk(1)
+a_inbox.append(list(bytes([0x11, 0,0,0,1])))                    # OPENED id=1
+a.connect("93.184.216.34", 443)                                # dotted-quad (DNS resolved upstream)
+assert a.state == "open", a.state
+a.send(b"GET / HTTP/1.0\\r\\n\\r\\n")                            # → DATA
+a_inbox.append(list(bytes([0x12, 0,0,0,1]) + b"HTTP/1.0 200 OK"))  # RDATA id=1
+got = a.recv(65536)
+a.close()                                                       # still open → emits CLOSE
+
+# B — peer closes: CLOSED → recv EOF, and our close() then does NOT re-emit.
+b, b_sent, b_inbox = mk(2)
+b_inbox.append(list(bytes([0x11, 0,0,0,2]))); b.connect("1.1.1.1", 443)
+b_inbox.append(list(bytes([0x13, 0,0,0,2])))                    # CLOSED id=2
+eof = b.recv(65536)
+b.close()
+
+json.dumps({
+  "open_frame": a_sent[0], "data_op": a_sent[1][0], "recv": got.decode(),
+  "a_frames": a_sent, "a_state": a.state,
+  "eof": eof.decode(), "b_frames": b_sent, "b_state": b.state,
+})
+`) as string;
+    const r = JSON.parse(out);
+    expect(r.open_frame).toEqual([0x01, 0, 0, 0, 1, 93, 184, 216, 34, 0x01, 0xbb]); // OPEN 93.184.216.34:443
+    expect(r.data_op).toBe(0x02); // DATA
+    expect(r.recv).toBe("HTTP/1.0 200 OK"); // RDATA delivered as recv bytes
+    expect(r.a_frames).toEqual([[0x01,0,0,0,1,93,184,216,34,0x01,0xbb], [0x02,0,0,0,1,71,69,84,32,47,32,72,84,84,80,47,49,46,48,13,10,13,10], [0x03,0,0,0,1]]); // OPEN, DATA, CLOSE
+    expect(r.a_state).toBe("closed");
+    expect(r.eof).toBe(""); // peer CLOSED → EOF
+    expect(r.b_frames).toEqual([[0x01,0,0,0,2,1,1,1,1,0x01,0xbb]]); // only OPEN — peer closed, so no redundant CLOSE
+    expect(r.b_state).toBe("closed");
+  });
 });
