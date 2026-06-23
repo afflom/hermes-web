@@ -143,3 +143,68 @@ export function connectEgress(extensionId: string): EgressChannel | null {
     },
   };
 }
+
+/** A CORS-free HTTP fetch via the extension's content channel — for the native agent's outbound LLM call to a
+ *  cross-origin provider (api.anthropic.com, …) the page itself can't reach (CORS). The service-worker fetch is
+ *  CORS-exempt (host_permissions); the response is streamed back in chunks and reassembled. */
+export interface ContentFetcher {
+  fetch(req: {
+    method: string;
+    url: string;
+    headers: [string, string][];
+    body: ArrayBuffer | null;
+  }): Promise<{ status: number; headers: [string, string][]; body: ArrayBuffer; error?: string }>;
+  close(): void;
+}
+
+export function connectContentFetch(extensionId: string): ContentFetcher | null {
+  const runtime = chromeRuntime();
+  if (!runtime || !extensionId) return null;
+  let port: ChromePort;
+  try {
+    port = runtime.connect(extensionId, { name: "holospaces-content" });
+  } catch {
+    return null;
+  }
+  let nextId = 1;
+  type Pending = {
+    chunks: Uint8Array[];
+    status: number;
+    headers: [string, string][];
+    resolve: (r: { status: number; headers: [string, string][]; body: ArrayBuffer; error?: string }) => void;
+  };
+  const pending = new Map<number, Pending>();
+  port.onMessage.addListener((msg: unknown) => {
+    const m = msg as { type: string; id: number; status?: number; headers?: [string, string][]; bytes?: number[]; error?: string };
+    const p = pending.get(m.id);
+    if (!p) return;
+    if (m.type === "head") { p.status = m.status ?? 0; p.headers = m.headers ?? []; }
+    else if (m.type === "chunk") { p.chunks.push(Uint8Array.from(m.bytes ?? [])); }
+    else if (m.type === "end") {
+      pending.delete(m.id);
+      const total = p.chunks.reduce((n, c) => n + c.length, 0);
+      const body = new Uint8Array(total);
+      let o = 0; for (const c of p.chunks) { body.set(c, o); o += c.length; }
+      p.resolve({ status: p.status, headers: p.headers, body: body.buffer });
+    } else if (m.type === "error") {
+      pending.delete(m.id);
+      p.resolve({ status: 0, headers: [], body: new ArrayBuffer(0), error: m.error });
+    }
+  });
+  return {
+    fetch: (req) =>
+      new Promise((resolve) => {
+        const id = nextId++;
+        pending.set(id, { chunks: [], status: 0, headers: [], resolve });
+        port.postMessage({
+          type: "fetch",
+          id,
+          url: req.url,
+          method: req.method,
+          headers: Object.fromEntries(req.headers),
+          body: req.body ? Array.from(new Uint8Array(req.body)) : null,
+        });
+      }),
+    close: () => { try { port.disconnect(); } catch { /* already gone */ } },
+  };
+}

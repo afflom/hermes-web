@@ -13,7 +13,7 @@
 
 import { setFetchImpl, setSocketFactory, resetTransport, HERMES_BASE_PATH } from "./api";
 import { guestRelativePath } from "./holo-transport";
-import { connectEgress, awaitEgressExtensionId, type EgressChannel } from "./holo-egress";
+import { connectEgress, connectContentFetch, awaitEgressExtensionId, type EgressChannel, type ContentFetcher } from "./holo-egress";
 import type { ToWorker, FromWorker } from "./holo-protocol";
 import type { HologramBootProgress } from "./holo-hologram-types";
 
@@ -28,6 +28,7 @@ let nextSid = 1;
 const pendingFetch = new Map<number, { resolve: (r: Response) => void; reject: (e: Error) => void }>();
 const liveSockets = new Map<number, WorkerSocket>();
 let egress: EgressChannel | null = null;
+let contentFetcher: ContentFetcher | null = null; // the native agent's cross-origin LLM call (CORS-free via the extension)
 // The WS backend's session token (T_guest). In the split it differs from the HTTP backend's token, so WS
 // upgrades must be (re)authed against the guest, not whatever token the dashboard built into the URL.
 let guestToken = "";
@@ -173,6 +174,15 @@ function handleData(m: FromWorker): boolean {
  *  fetch (the established content egress), wired with the cross-origin-provider increment. */
 async function answerHttpFetch(worker: Worker, m: Extract<FromWorker, { t: "httpfetch" }>): Promise<void> {
   try {
+    // A cross-origin provider (api.anthropic.com, …) is CORS-blocked from the page, so route it through the
+    // extension's CORS-free fetch (the established egress). Same-origin (e2e mock, a co-hosted/CORS-OK endpoint)
+    // resolves via the page's fetch directly.
+    const crossOrigin = new URL(m.url, location.href).origin !== location.origin;
+    if (crossOrigin && contentFetcher) {
+      const r = await contentFetcher.fetch({ method: m.method, url: m.url, headers: m.headers, body: m.body });
+      worker.postMessage({ t: "httpfetchres", fid: m.fid, status: r.status, headers: r.headers, body: r.body, error: r.error }, [r.body]);
+      return;
+    }
     const res = await fetch(m.url, {
       method: m.method,
       headers: m.headers,
@@ -218,6 +228,8 @@ export async function bootWorkerTransport(report: (p: HologramBootProgress) => v
   const extId = await awaitEgressExtensionId(1200);
   egress = extId ? connectEgress(extId) : null;
   egress?.onFrame((frame) => sendWs({ t: "egressin", frame }, [frame.buffer]));
+  // The native agent's cross-origin LLM call rides the same extension's CORS-free fetch (content channel).
+  contentFetcher = extId ? connectContentFetch(extId) : null;
 
   // Install the dashboard's HTTP transport + the WS factory + diagnostic hooks once the HTTP backend serves,
   // then resolve. The WS factory is installed HERE (early) so the dashboard's chat opens a WorkerSocket (which
@@ -297,6 +309,8 @@ export function stopWorkerTransport(): void {
   httpWorker?.terminate();
   if (wsWorker && wsWorker !== httpWorker) wsWorker.terminate();
   httpWorker = wsWorker = null;
+  contentFetcher?.close();
+  contentFetcher = null;
   socketsArmed = false;
   splitMode = false;
   guestToken = "";

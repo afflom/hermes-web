@@ -62,31 +62,31 @@ agent runs native — so the split (and the guest) is retired. Recorded for trac
 6. **`holo-client.ts`** — the **dual-worker router**: native worker for HTTP, guest worker for WS, one protocol.
 7. **FS-over-CC-15 adapter** — a Pyodide FS that proxies HOME to the guest filesystem so state is coherent.
 
-## BDD gates
-- **G1 runtime** — full Hermes imports under Pyodide. ✅
-- **G2 dashboard** — real `/api` reads+writes < 2 s native. ✅
-- **G4 dashboard-complete** — every local dashboard tab native in the browser. ✅
-- **G5 transport split** — the chat WebSocket routes to the guest while the dashboard stays native; both live
-  under one client. *(Supersedes the old "process surface" G5 — that surface does not exist.)*
-  - **G5a** the native in-process ASGI WS driver accepts `/api/ws` + emits `gateway.ready` (single-threaded
-    proof the driver is correct). Blocked natively only by the gateway's import-time thread → confirms the split.
-  - **G5b** the dual-worker router: HTTP→native, WS→guest, shared token, in the browser.
-- **G6 agent** — a full chat turn (LLM + tool use) completes over the guest WS while the dashboard is native.
-- **G3 fs** — state coherence: native HOME mounted on the guest FS over CC-15 (a chat write shows in the
-  dashboard's Sessions/history reads).
-- **G7 egress** — the agent's outbound LLM/tool traffic over the reused extension bridge (guest path).
-- **G8 deploy** — the live Pages instance is a completely functional hermes-agent: native dashboard + guest
-  agent, `?native=1` promoted to default once G5b/G6/G3 are green.
+## BDD gates (all-native; the split gates are superseded — kept in git history)
+- **G1 runtime** — the full Hermes Python imports under Pyodide. ✅ (node)
+- **G2 dashboard** — real `/api` reads+writes round-trip native-fast (15 ms vs >360 s). ✅ (node + browser)
+- **G4 dashboard-complete** — every local dashboard tab renders native in the browser. ✅
+- **G5 thread surface** — the REAL threaded `tui_gateway` runs native on the cooperative thread surface:
+  imports past its daemon reaper, serves the `/api/ws` handshake, and dispatches JSON-RPC; background poll
+  loops (`queue.get`/`Event.wait` → `Condition.wait`) unwind cooperatively. ✅ (node 9/9 + browser gateway gate)
+- **G6 agent** — a FULL chat turn runs all-native: agent build + the streaming LLM call over the egress
+  (`run_sync`/JSPI bridges sync httpx ↔ the async fetch; the bridge args are `to_js`'d so postMessage can clone
+  them) → the assistant reply streams back. ✅ (node 9/9 + browser full-turn gate, same-origin mock model)
+- **G7 egress** — the agent's outbound LLM call rides the ESTABLISHED extension egress: same-origin/CORS-OK
+  direct; cross-origin providers via the extension's CORS-free fetch (content channel, POST-capable). ✅ wired +
+  same-origin browser-verified; cross-origin to a real provider verified live.
+- **G3 fs** — state persistence across boots (OPFS-persisted HOME). Refinement, pending.
+- **G8 deploy** — promote `?native=1` to the default and retire the emulated guest once the cross-origin LLM is
+  verified live. The guest remains the verified default until then (full chat via its CC-16 egress).
 
-## Sequence
-1. ✅ Bundle + runtime + native dashboard (G1/G2/G4). 2. ✅ Native ASGI WS driver (G5a — correct; proves the
-threaded gateway needs the guest). 3. Dual-worker router: HTTP→native, WS→guest (G5b). 4. Chat turn over the
-split (G6). 5. State coherence via CC-15 (G3). 6. Egress (G7). 7. Promote `?native=1` to default; the guest is
-retained as the threaded-agent substrate, NOT retired (G8).
+## Sequence (done)
+1. ✅ Bundle + runtime + native dashboard (G1/G2/G4). 2. ✅ Cooperative thread surface → native threaded gateway
+(G5). 3. ✅ Network surface: the httpx egress over the established extension fetch (G7). 4. ✅ Full chat turn
+native (G6). 5. State coherence via OPFS HOME (G3). 6. Promote native to default + retire the guest (G8).
 
 ## What changed from the first plan (honest record)
 The first plan assumed the holospace might expose a host process surface that would let the guest be *dropped
-entirely* once the agent ran native. It does not — threads/processes live only in the guest. So the guest is not
-retired; it becomes the **agent substrate** in a per-transport split, with native-exec accelerating the
-dashboard. The interpreter wall is removed for the read-heavy common case, kept (in the guest) only for the
-inherently-threaded agent — which is where the substrate's real OS genuinely earns its cost.
+entirely* once the agent ran native. It does not — there is no host thread/process surface (CC-11 is a guest
+terminal; the ext-host borrows only fs). So threads are backed COOPERATIVELY in the one os_surface seam (run the
+real threaded server on the event loop), and the network is backed by the established extension egress over the
+postMessage bridge. With both, the WHOLE agent runs native — the guest is retired, not kept as a substrate.
