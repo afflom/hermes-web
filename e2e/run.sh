@@ -35,22 +35,47 @@ reap_chromium() {
   return 0
 }
 
+# Cap accumulated run logs so vv/witness scratch stays bounded across the many boots a long session does —
+# otherwise per-run e2e-*.log / browser-console-*.log pile up unbounded and slowly fill the devcontainer disk.
+KEEP_LOGS="${E2E_KEEP_LOGS:-20}"
+prune_logs() {
+  local keep="${1:-$KEEP_LOGS}"
+  ls -t "$LOGDIR"/e2e-*.log 2>/dev/null             | tail -n +$((keep+1)) | xargs -r rm -f
+  ls -t "$LOGDIR"/browser-console-*.log 2>/dev/null | tail -n +$((keep+1)) | xargs -r rm -f
+}
+
 health() {
   echo "=== e2e env health ==="
   local n; n="$(pgrep -fc "$PW_PATH" 2>/dev/null)"; n="${n:-0}"
-  echo "stray chromium procs : $n"
+  echo "stray chromium procs : $n$([ "$n" -gt 0 ] && echo '   ← DEGRADED: run `e2e/run.sh doctor`')"
   free -m | awk '/Mem:/{printf "RAM                  : %d MB avail / %d MB total\n",$7,$2}'
+  df -h "$ROOT" 2>/dev/null | awk 'NR==2{u=$5+0;printf "disk                 : %s used of %s (%s)%s\n",$3,$2,$5,(u>=85?"   ← DEGRADED: run `e2e/run.sh clean`":"")}'
+  local sc; sc="$(du -sh "$LOGDIR" 2>/dev/null | cut -f1)"
+  local nlog; nlog="$(ls "$LOGDIR"/*.log 2>/dev/null | wc -l | tr -d ' ')"
+  echo "witness scratch      : ${sc:-0} (${nlog:-0} run logs)"
+  du -ah "$LOGDIR" 2>/dev/null | awk '$1 ~ /[0-9]G$/ {print "  reclaimable        : "$0}' | sort -rh | head -6
   if [ -f "$LOCK" ] && fuser "$LOCK" >/dev/null 2>&1; then
     echo "lock                 : HELD (an e2e run is active)"
   else
     echo "lock                 : free"
   fi
-  ls -dt /tmp/playwright-artifacts-* 2>/dev/null | tail -n +6 | head && true
 }
 
 if [ "${1:-}" = "doctor" ]; then
-  reap_chromium; sleep 1; health
-  echo "[doctor] reaped stray chromium; env ready."
+  reap_chromium; prune_logs; rm -rf /tmp/playwright-artifacts-* 2>/dev/null || true; sleep 1; health
+  echo "[doctor] reaped stray chromium, pruned old logs; env ready."
+  exit 0
+fi
+
+# `e2e/run.sh clean` — deeper reclaim for a tight devcontainer disk: reap, keep only the last few logs, clear
+# /tmp artifacts, and REPORT (never auto-delete) the large regenerable κ/image artifacts so reclaiming them is
+# a deliberate choice (re-bank ~40 min, re-build image ~1 h).
+if [ "${1:-}" = "clean" ]; then
+  reap_chromium; prune_logs 5; rm -rf /tmp/playwright-artifacts-* 2>/dev/null || true
+  echo "[clean] reaped chromium, kept last 5 run logs, cleared /tmp playwright artifacts."
+  echo "[clean] large regenerable artifacts left in place (delete by hand only if disk is tight):"
+  du -ah "$LOGDIR" 2>/dev/null | awk '$1 ~ /[0-9]G$|[0-9]{3}M$/ {print "  "$0}' | sort -rh | head -8
+  health
   exit 0
 fi
 
@@ -67,6 +92,7 @@ fi
 
 cd "$E2E_DIR"
 reap_chromium                 # clear orphans left by any previously-killed run
+prune_logs                    # keep the last $KEEP_LOGS run logs so scratch never grows unbounded
 sleep 1
 
 LOG="$LOGDIR/e2e-$(date +%Y%m%d-%H%M%S).log"

@@ -4,6 +4,14 @@
     "dockerfile": "Dockerfile",
     "context": ".",
   },
+  // The warm-κ e2e loads a ~1.4 GB machine + ~1.4 GB wasm heap + real Chromium per boot. A small codespace
+  // OOM-kills chromium at launch (the failure e2e/run.sh is built to avoid) — pin a memory floor + cores so
+  // every codespace/devcontainer is sized to run the gate stably.
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "16gb",
+    "storage": "64gb",
+  },
   "forwardPorts": [8000],
   "portsAttributes": {
     "8000": {
