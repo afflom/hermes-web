@@ -203,6 +203,24 @@ const TOKEN_RE = /window\.__HERMES_SESSION_TOKEN__\s*=\s*"([^"]+)"/;
 const EMBEDDED_RE = /window\.__HERMES_DASHBOARD_EMBEDDED_CHAT__\s*=\s*(true|false)/;
 const AUTH_RE = /window\.__HERMES_AUTH_REQUIRED__\s*=\s*(true|false)/;
 
+/** Adopt the session token from the seeded "/" (the dashboard HTML), if it was captured into the warm seed.
+ *  The token is frozen in the κ, so the seeded value is the one the resumed guest validates — letting the boot
+ *  skip the costly first-dial establishment. Returns null when "/" is not seeded (older seeds) → dial fallback. */
+function tokenFromSeed(
+  responses: Record<string, { status: number; ct: string; body: string }> | null,
+): { token: string; embedded: boolean; authRequired: boolean } | null {
+  const root = responses?.["/"];
+  if (!root || root.status !== 200 || !root.body) return null;
+  const bytes = new Uint8Array(root.body.length / 2);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(root.body.substr(i * 2, 2), 16);
+  const html = new TextDecoder().decode(bytes);
+  const m = html.match(TOKEN_RE);
+  if (!m) return null;
+  const em = html.match(EMBEDDED_RE);
+  const au = html.match(AUTH_RE);
+  return { token: m[1], embedded: em ? em[1] === "true" : true, authRequired: au ? au[1] === "true" : false };
+}
+
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
 function post(msg: FromWorker, transfer?: Transferable[]) {
   ctx.postMessage(msg, transfer ?? []);
@@ -256,7 +274,6 @@ async function boot(_useOpfs: boolean, diagMode?: string, egressIsAvailable = fa
   // the snapshot streams, so they never land on the wasm heap. Combined with the SPARSE κ (no dense zero
   // free-space), the wasm heap holds only RAM + the sparse indices → resume peaks well under 1.5 GB.
   const diskHandle = await openDiskHandle();
-  let ws: HoloWorkspace;
   const FEED = 16 * 1024 * 1024;
   let ci = 0;
   let cOff = 0;
@@ -288,7 +305,7 @@ async function boot(_useOpfs: boolean, diagMode?: string, egressIsAvailable = fa
     sample();
     return win;
   };
-  ws = hs.Workspace.resume_devcontainer_net_bridged_fed_opfs(next, diskHandle);
+  const ws = hs.Workspace.resume_devcontainer_net_bridged_fed_opfs(next, diskHandle);
   for (let i = 0; i < gz.length; i++) gz[i] = null; // ensure everything is freed
   log("info", `resumed (streamed-fed) in ${since(tResume)}, peak ${(peakBytes / 1e6).toFixed(0)} MB`);
   post({ t: "peakbytes", bytes: peakBytes });
@@ -343,22 +360,33 @@ async function boot(_useOpfs: boolean, diagMode?: string, egressIsAvailable = fa
   startConsoleRelay(runtime); // surface the in-guest server/agent logs to the browser console
 
   report({ phase: "token", detail: "authenticating with the in-guest server" });
-  // Diagnostic: while authenticating, surface the pump state so a hung auth shows whether the interpreter
-  // is advancing (pump alive, guest not responding) or stalled (pump stuck).
-  let lastRun = 0;
-  const authDiag = setInterval(() => {
-    const m = runtime!.metrics();
-    log("info", `auth wait: pump ${m.ticks} ticks, ${m.runMs}ms cpu (+${m.runMs - lastRun}ms), ${m.fetchesInFlight} in-flight`);
-    lastRun = m.runMs;
-  }, 4000);
-  const token = await adoptToken(runtime).finally(() => clearInterval(authDiag));
-  log("info", `in-guest server authenticated; ready in ${since(t0)} total`);
-
-  // k-aligned read seed: serve the dashboard's reads from the warm κ's bank-captured responses. Seed BEFORE
+  // k-aligned read seed: serve the dashboard's reads from the warm κ's bank-captured responses. Loaded BEFORE
   // `ready` so the dashboard's ~10-fetch mount burst hits the content-addressed cache (instant) instead of
-  // the serialized single-connection guest. Without it the mount round-trips the guest at ~2-3 s/read and
-  // starves on the one-connection-at-a-time lane.
+  // the serialized single-connection guest (which round-trips at ~2-3 s/read and starves on the one-lane bridge).
   const warmResponses = await loadWarmResponses();
+
+  // Adopt the session token from the seeded "/" if it was captured. The token is minted once at the guest's
+  // import and FROZEN into the κ (web_server.py `_SESSION_TOKEN`), so the bank-time token in the seeded "/" is
+  // exactly the one the resumed guest validates — adopting it here takes the one-time ~1.45 B-instruction
+  // first-request establishment OFF the boot critical path (it is otherwise the dominant boot term, ~120 s on
+  // a slow CPU). We pay that establishment in the BACKGROUND below so the first real (non-seeded) call is
+  // already warm, while the user already sees the fully-seeded dashboard. Falls back to dialing the guest when
+  // "/" is not seeded (older seeds) — identical to the prior behaviour.
+  let token = tokenFromSeed(warmResponses);
+  const authFromSeed = token != null;
+  if (!authFromSeed) {
+    // Diagnostic: while authenticating, surface the pump state so a hung auth shows whether the interpreter
+    // is advancing (pump alive, guest not responding) or stalled (pump stuck).
+    let lastRun = 0;
+    const authDiag = setInterval(() => {
+      const m = runtime!.metrics();
+      log("info", `auth wait: pump ${m.ticks} ticks, ${m.runMs}ms cpu (+${m.runMs - lastRun}ms), ${m.fetchesInFlight} in-flight`);
+      lastRun = m.runMs;
+    }, 4000);
+    token = await adoptToken(runtime).finally(() => clearInterval(authDiag));
+  }
+  log("info", `in-guest server authenticated; ready in ${since(t0)} total${authFromSeed ? " (seed-served auth, establishment deferred)" : ""}`);
+
   if (warmResponses) log("info", `seeded ${seedReadCache(warmResponses)} dashboard reads from the warm κ`);
   else log("warn", "no warm-responses.json — dashboard reads will round-trip the guest (slow)");
 
@@ -372,8 +400,13 @@ async function boot(_useOpfs: boolean, diagMode?: string, egressIsAvailable = fa
   // a LIGHT warm endpoint (/api/config) — NOT /api/status. CRITICAL: go through runGuestFetch (the single
   // lane), NOT runtime.fetch directly — a direct fetch would race the dashboard's mount fetches as a 2nd
   // concurrent connection, and the guest serves only ONE at a time, so both would stall.
-  runGuestFetch({ path: "/api/config", method: "GET", headers: { authorization: `Bearer ${token.token}` } })
-    .then((r) => { const ok = r.status >= 200 && r.status < 300; log(ok ? "info" : "warn", `/api/config → ${r.status}`); post({ t: "apiok", ok }); })
+  // This probe DOUBLES as the establishment warm-up: when auth was served from the seed, adoptToken never
+  // dialed, so this is the FIRST real loopback connection — it pays the one-time post-resume establishment
+  // (~1.45 B instr) HERE, off the boot critical path, while the user already sees the fully-seeded dashboard.
+  // It therefore needs the full establishment budget (the 120 s default times out mid-establishment and the
+  // guest would never register as warm — `__HOLO_API_OK__` stays false and real interactions never enable).
+  runGuestFetch({ path: "/api/config", method: "GET", headers: { authorization: `Bearer ${token.token}` }, timeoutMs: 360_000 })
+    .then((r) => { const ok = r.status >= 200 && r.status < 300; log(ok ? "info" : "warn", `/api/config → ${r.status}${authFromSeed ? " (establishment paid off critical path)" : ""}`); post({ t: "apiok", ok }); })
     .catch((e) => { log("error", `/api/config failed: ${e}`); post({ t: "apiok", ok: false }); });
 }
 
@@ -392,17 +425,24 @@ function startConsoleRelay(rt: BridgeRuntime): void {
   }, 1000);
 }
 
+// The guest's real "/" response from the fallback adoptToken dial — stashed so a capture (capraw "/") can be
+// served from it WITHOUT re-dialing the single guest lane (which the background /api/config establishment
+// probe holds for minutes). This is exactly the bytes the guest served; the seed re-capture writes them.
+let capturedRoot: { status: number; ct: string; body: Uint8Array } | null = null;
+
 async function adoptToken(rt: BridgeRuntime): Promise<{ token: string; embedded: boolean; authRequired: boolean }> {
   let lastErr: unknown;
   for (let attempt = 0; attempt < 240; attempt++) {
     try {
       const res = await rt.fetch("/", { headers: { accept: "text/html" } });
-      const html = await res.text();
+      const buf = new Uint8Array(await res.arrayBuffer());
+      const html = new TextDecoder().decode(buf);
       const m = html.match(TOKEN_RE);
       if (attempt < 3 || m) log("info", `auth attempt ${attempt + 1}: / → ${html.length}B, token=${!!m}`);
       if (m) {
         const em = html.match(EMBEDDED_RE);
         const au = html.match(AUTH_RE);
+        capturedRoot = { status: res.status, ct: res.headers.get("content-type") || "text/html; charset=utf-8", body: buf };
         return { token: m[1], embedded: em ? em[1] === "true" : true, authRequired: au ? au[1] === "true" : false };
       }
     } catch (e) {
@@ -436,7 +476,17 @@ ctx.onmessage = (ev: MessageEvent<ToWorker>) => {
       // Seed-capture only: dial the guest DIRECTLY (bypass the seed, the /api/status short-circuit, and the
       // egress gate) so we record the guest's true response (e.g. /api/status → 200, not the uncached 503).
       if (!runtime) return post({ t: "fetcherr", rid: msg.rid, message: "runtime not ready" });
-      runGuestFetch({ path: msg.path, method: "GET", headers: msg.headers ?? {}, timeoutMs: 240_000 })
+      // "/" was already served by the fallback adoptToken dial — return THOSE exact bytes rather than re-dialing
+      // the single lane (the background /api/config establishment probe holds it for minutes, so a re-dial
+      // would time out). This is the guest's real "/" response; the seed re-capture records it verbatim.
+      if (msg.path === "/" && capturedRoot) {
+        const body = capturedRoot.body.buffer.slice(capturedRoot.body.byteOffset, capturedRoot.body.byteOffset + capturedRoot.body.byteLength);
+        return post(
+          { t: "fetchres", rid: msg.rid, status: capturedRoot.status, statusText: "OK", headers: [["content-type", capturedRoot.ct]], body },
+          [body],
+        );
+      }
+      runGuestFetch({ path: msg.path, method: "GET", headers: msg.headers ?? {}, timeoutMs: 400_000 })
         .then((r) => {
           const body = r.body.slice(0);
           post({ t: "fetchres", rid: msg.rid, status: r.status, statusText: r.statusText, headers: r.headers, body }, [body]);

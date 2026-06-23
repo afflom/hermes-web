@@ -83,11 +83,13 @@ test("the in-browser holospaces backend resumes, authenticates, and renders the 
   // local read that misses the seed round-trips the single guest lane (~10 s) and is the "dashboard takes an
   // hour" regression; we assert below that the only misses are the legitimately un-seedable ones.
   const guestGets: string[] = [];
+  let seedServedAuth = false; // did the boot adopt the session token from the warm seed (establishment deferred)?
   page.on("console", (m) => {
     const t = m.text();
     recordConsole(`[browser:${m.type()}] ${t}`);
     const g = t.match(/→ guest GET (\S+)/);
     if (g) guestGets.push(g[1]);
+    if (/seed-served auth/.test(t)) seedServedAuth = true;
   });
   page.on("pageerror", (e) => recordConsole(`[browser:pageerror] ${e.message}`));
   await page.goto("./", { waitUntil: "load" });
@@ -185,4 +187,11 @@ test("the in-browser holospaces backend resumes, authenticates, and renders the 
   const seedMisses = uniqueGets.filter((p) => !allowMiss.test(p));
   recordConsole(`[seed-gate] ${uniqueGets.length} unique guest GETs; seed-miss(es): ${seedMisses.join(", ") || "none"}`);
   expect(seedMisses, `dashboard local reads must hit the warm seed, not the slow guest lane: ${seedMisses.join(", ")}`).toEqual([]);
+
+  // FAIL-CLOSED establishment-latency gate. The boot MUST adopt the session token from the seeded "/" rather
+  // than dialing the guest — that keeps the one-time ~1.45 B-instruction first-request re-establishment (the
+  // dominant boot term, ~120 s on a slow CPU) OFF the critical path; it is paid by a background warm-up dial
+  // while the user already sees the fully-seeded dashboard. If the seed ever ships without "/", the boot falls
+  // back to the slow first dial and this fails — the regression the seed re-capture must prevent.
+  expect(seedServedAuth, 'boot must serve auth from the warm seed ("/" captured) so the establishment is deferred, not on the critical path').toBe(true);
 });
