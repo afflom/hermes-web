@@ -185,4 +185,36 @@ json.dumps({
     expect(r.b_frames).toEqual([[0x01,0,0,0,2,1,1,1,1,0x01,0xbb]]); // only OPEN — peer closed, so no redundant CLOSE
     expect(r.b_state).toBe("closed");
   });
+
+  // G6-http: Pyodide has no ssl, so the agent's HTTPS rides the browser's TLS via the CORS-free fetch egress.
+  // ONE httpx transport patch intercepts EVERY model SDK (they all sit on httpx) and routes the request to the
+  // fetch bridge — proving the agent's provider code reaches the egress unchanged. (In-browser the bridge is
+  // run_sync over the extension's fetch; here a synchronous fake stands in for the JSPI/extension path.)
+  it("G6: install_http_egress routes httpx (every model SDK) through the fetch egress", () => {
+    const out = py.runPython(`
+import types, json
+_m = types.ModuleType("os_net"); exec(${JSON.stringify(readFileSync(path.join(REPO, "web/src/native/os_net.py"), "utf8"))}, _m.__dict__)
+
+calls = []
+def fake_fetch(method, url, headers, body):
+    calls.append({"method": method, "url": url, "auth": dict(headers).get("x-api-key"),
+                  "body": body.decode() if body else ""})
+    return (200, [("content-type", "application/json")], b'{"content":[{"text":"hi"}]}')
+
+_m.install_http_egress(fake_fetch)
+import httpx
+# A model-SDK-shaped POST: the patch must intercept it (no socket, no TLS) and hand it to the fetch egress.
+r = httpx.Client().post("https://api.anthropic.com/v1/messages",
+                        headers={"x-api-key": "sk-test"}, json={"model": "claude", "max_tokens": 1})
+json.dumps({"status": r.status_code, "json": r.json(), "calls": calls})
+`) as string;
+    const r = JSON.parse(out);
+    expect(r.status, "the egress response surfaces as the httpx response").toBe(200);
+    expect(r.json.content[0].text).toBe("hi");
+    expect(r.calls.length, "the SDK's HTTPS call was intercepted (no socket/TLS)").toBe(1);
+    expect(r.calls[0].method).toBe("POST");
+    expect(r.calls[0].url).toBe("https://api.anthropic.com/v1/messages");
+    expect(r.calls[0].auth, "auth header carried through to the egress").toBe("sk-test");
+    expect(JSON.parse(r.calls[0].body).model).toBe("claude"); // the request body reached the egress
+  });
 });

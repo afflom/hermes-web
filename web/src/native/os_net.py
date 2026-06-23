@@ -141,3 +141,35 @@ class EgressSocket:
         if self._block is None:
             raise WouldBlock("no blocking pump installed (in-browser this is run_sync) and no buffered frame")
         self._block()
+
+
+def install_http_egress(fetch) -> None:
+    """Route the agent's outbound HTTPS through the BROWSER's TLS via the established CORS-free fetch egress —
+    the router extension's content role (a service-worker ``fetch`` is CORS-exempt, so it reaches the model
+    APIs the page cannot). Pyodide ships NO ``ssl`` module, so Python cannot do TLS over the raw CC-16 socket;
+    the browser must. This is still the one established egress, just its HTTP role rather than its socket role.
+
+    ``fetch(method, url, headers, body) -> (status, headers, body)`` performs the request in the extension
+    (DNS+TLS+HTTP). ONE httpx transport patch covers every model SDK (anthropic/openai/… all sit on httpx), so
+    the agent's provider code runs unchanged. In-browser ``fetch`` bridges sync↔async via ``run_sync`` (JSPI).
+    """
+    import httpx
+
+    def _handle_request(self, request):  # httpx.HTTPTransport.handle_request
+        body = request.read()
+        headers = [
+            (
+                k.decode("latin-1") if isinstance(k, (bytes, bytearray)) else k,
+                v.decode("latin-1") if isinstance(v, (bytes, bytearray)) else v,
+            )
+            for k, v in request.headers.raw
+        ]
+        status, resp_headers, resp_body = fetch(request.method, str(request.url), headers, bytes(body))
+        return httpx.Response(
+            status_code=int(status),
+            headers=list(resp_headers),
+            content=bytes(resp_body),
+            request=request,
+        )
+
+    httpx.HTTPTransport.handle_request = _handle_request
